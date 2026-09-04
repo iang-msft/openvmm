@@ -85,6 +85,27 @@ fn verify_filesystem_after_apply() -> anyhow::Result<()> {
         "ungranted /etc/passwd is still visible after applying the sandbox"
     );
 
+    let tmp_entries = std::fs::read_dir("/tmp")
+        .context("failed to list the sandbox /tmp")?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .context("failed to read an entry in the sandbox /tmp")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if tmp_entries.is_empty() {
+        println!("sandbox /tmp contents: <empty>");
+    } else {
+        println!("sandbox /tmp contents:");
+        for entry in &tmp_entries {
+            println!("  {}", entry.to_string_lossy());
+        }
+    }
+    ensure!(
+        tmp_entries.is_empty(),
+        "sandbox /tmp unexpectedly exposed existing contents"
+    );
+
     let tmp_probe = Path::new("/tmp/sandbox_test_launcher_write_probe");
     std::fs::write(tmp_probe, b"sandbox filesystem probe")
         .context("implicit /tmp mount is not writable")?;
