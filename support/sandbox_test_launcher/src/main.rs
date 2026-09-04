@@ -16,8 +16,14 @@ fn main() -> anyhow::Result<()> {
     let profile = profiles::minimal().name("sandbox_test_launcher").build();
     let preparation = sandbox::prepare(&profile, &Identity::default(), &[])?;
 
+    #[cfg(target_os = "linux")]
+    verify_filesystem_before_apply()?;
+
     enter_namespaces(&preparation)?;
     run_sandbox_stage("apply", sandbox::apply(&profile));
+
+    #[cfg(target_os = "linux")]
+    verify_filesystem_after_apply()?;
 
     let restrictions = Restrictions::none().syscalls(&["socket"]).build();
     run_sandbox_stage("tighten", sandbox::tighten(&restrictions));
@@ -34,6 +40,64 @@ fn run_sandbox_stage(stage: &str, result: Result<(), sandbox::Error>) {
         eprintln!("sandbox {stage} failed: {error}");
         std::process::exit(sandbox::EXIT_SANDBOX_FAILED);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_filesystem_before_apply() -> anyhow::Result<()> {
+    use anyhow::ensure;
+    use std::path::Path;
+
+    ensure!(
+        Path::new("/etc/passwd").exists(),
+        "/etc/passwd was not visible before applying the sandbox"
+    );
+    ensure!(
+        Path::new("/bin").exists(),
+        "/bin was not visible before applying the sandbox"
+    );
+    ensure!(
+        Path::new("/lib").exists(),
+        "/lib was not visible before applying the sandbox"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_filesystem_after_apply() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use anyhow::ensure;
+    use std::path::Path;
+
+    ensure!(
+        Path::new("/bin").exists(),
+        "explicit /bin grant is not visible after applying the sandbox"
+    );
+    ensure!(
+        Path::new("/lib").exists(),
+        "explicit /lib grant is not visible after applying the sandbox"
+    );
+    ensure!(
+        Path::new("/proc/self/status").exists(),
+        "implicit /proc mount is not visible after applying the sandbox"
+    );
+    ensure!(
+        !Path::new("/etc/passwd").exists(),
+        "ungranted /etc/passwd is still visible after applying the sandbox"
+    );
+
+    let tmp_probe = Path::new("/tmp/sandbox_test_launcher_write_probe");
+    std::fs::write(tmp_probe, b"sandbox filesystem probe")
+        .context("implicit /tmp mount is not writable")?;
+    std::fs::remove_file(tmp_probe).context("failed to remove /tmp filesystem probe")?;
+
+    let bin_probe = Path::new("/bin/sandbox_test_launcher_write_probe");
+    ensure!(
+        std::fs::write(bin_probe, b"unexpected write").is_err(),
+        "read-only /bin grant allowed a write"
+    );
+
+    println!("filesystem visibility and access verified");
+    Ok(())
 }
 
 #[cfg(all(target_os = "linux", debug_assertions))]

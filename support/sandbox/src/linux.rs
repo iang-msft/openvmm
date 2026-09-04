@@ -257,6 +257,11 @@ fn apply_landlock(grants: &[FsGrant]) -> io::Result<()> {
             .map_err(landlock_err)?;
     }
 
+    let tmp_rights = (from_read & !AccessFs::Execute) | from_write;
+    ruleset = ruleset
+        .add_rules(path_beneath_rules(&[Path::new("/tmp")], tmp_rights))
+        .map_err(landlock_err)?;
+
     let status = ruleset.restrict_self().map_err(landlock_err)?;
     tracing::debug!(
         ruleset = ?status.ruleset,
