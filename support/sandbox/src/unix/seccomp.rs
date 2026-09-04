@@ -255,6 +255,9 @@ pub fn nr_for_name(name: &str) -> Option<i64> {
         "sigaltstack" => libc::SYS_sigaltstack,
         "execve" => libc::SYS_execve,
         "wait4" => libc::SYS_wait4,
+        "kill" => libc::SYS_kill,
+        "tkill" => libc::SYS_tkill,
+        "tgkill" => libc::SYS_tgkill,
         // Memory management
         "brk" => libc::SYS_brk,
         "mmap" => libc::SYS_mmap,
@@ -541,6 +544,9 @@ mod tests {
     fn nr_for_name_resolves_known_and_rejects_unknown() {
         assert_eq!(nr_for_name("read"), Some(libc::SYS_read));
         assert_eq!(nr_for_name("openat"), Some(libc::SYS_openat));
+        assert_eq!(nr_for_name("kill"), Some(libc::SYS_kill));
+        assert_eq!(nr_for_name("tkill"), Some(libc::SYS_tkill));
+        assert_eq!(nr_for_name("tgkill"), Some(libc::SYS_tgkill));
         assert_eq!(nr_for_name("exit_group"), Some(libc::SYS_exit_group));
         assert_eq!(nr_for_name("definitely_not_a_syscall"), None);
         // Legacy spellings are intentionally not recognized.

@@ -11,5 +11,8 @@ sandbox.workspace = true
 
 anyhow.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["sched", "user"] }
+
 [lints]
 workspace = true
