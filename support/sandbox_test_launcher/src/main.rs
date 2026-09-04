@@ -22,6 +22,9 @@ fn main() -> anyhow::Result<()> {
     let restrictions = Restrictions::none().syscalls(&["socket"]).build();
     run_sandbox_stage("tighten", sandbox::tighten(&restrictions));
 
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    verify_socket_denied()?;
+
     println!("sandbox applied and tightened successfully");
     Ok(())
 }
@@ -30,6 +33,22 @@ fn run_sandbox_stage(stage: &str, result: Result<(), sandbox::Error>) {
     if let Err(error) = result {
         eprintln!("sandbox {stage} failed: {error}");
         std::process::exit(sandbox::EXIT_SANDBOX_FAILED);
+    }
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn verify_socket_denied() -> anyhow::Result<()> {
+    use anyhow::bail;
+    use nix::errno::Errno;
+    use std::net::TcpListener;
+
+    match TcpListener::bind(("127.0.0.1", 0)) {
+        Err(error) if error.raw_os_error() == Some(Errno::EPERM as i32) => {
+            println!("socket creation denied as expected");
+            Ok(())
+        }
+        Err(error) => bail!("socket creation failed with an unexpected error: {error}"),
+        Ok(_) => bail!("socket creation succeeded after it was denied by tighten"),
     }
 }
 
