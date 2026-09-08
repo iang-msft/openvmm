@@ -5922,6 +5922,7 @@ dependencies = [
  "pcie_remote_resources",
  "prost",
  "rustyline",
+ "sandbox",
  "scsidisk_resources",
  "serial_16550_resources",
  "serial_core",

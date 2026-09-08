@@ -168,12 +168,9 @@ pub fn prepare(
 
 #[cfg(target_os = "linux")]
 fn linux_clone_flags(profile: &Profile) -> u64 {
-    let mut flags = libc::CLONE_NEWUSER;
+    let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
     if profile.inner.network != crate::Network::Unrestricted {
         flags |= libc::CLONE_NEWNET;
-    }
-    if !profile.inner.fs.is_empty() {
-        flags |= libc::CLONE_NEWNS;
     }
     flags as u64
 }
@@ -226,7 +223,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(
             prep.clone_flags,
-            (libc::CLONE_NEWUSER | libc::CLONE_NEWNET) as u64
+            (libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWNET) as u64
         );
     }
 
@@ -241,7 +238,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn filesystem_grants_request_a_mount_namespace() {
+    fn filesystem_grants_preserve_default_namespaces() {
         let profile = Profile::deny_all().read("/usr/lib").build();
 
         assert_eq!(
@@ -257,7 +254,10 @@ mod tests {
             .network(crate::Network::Unrestricted)
             .build();
 
-        assert_eq!(linux_clone_flags(&profile), libc::CLONE_NEWUSER as u64);
+        assert_eq!(
+            linux_clone_flags(&profile),
+            (libc::CLONE_NEWUSER | libc::CLONE_NEWNS) as u64
+        );
     }
 
     #[cfg(target_os = "linux")]

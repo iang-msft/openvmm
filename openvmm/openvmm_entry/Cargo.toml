@@ -72,6 +72,7 @@ mesh_rpc.workspace = true
 mesh_process.workspace = true
 mesh_worker.workspace = true
 pal.workspace = true
+sandbox.workspace = true
 unix_socket.workspace = true
 pal_async.workspace = true
 sparse_mmap.workspace = true

@@ -1115,7 +1115,7 @@ impl VmService {
         // Create a VmmMesh for local/in-process workers.
         let mesh = VmmMesh::new(&self.driver, true)?;
         let vm_host = mesh
-            .make_host("vm", None)
+            .make_sandboxed_host(crate::meshworker::SandboxRole::Vm, None)
             .await
             .context("spawning vm process failed")?;
 

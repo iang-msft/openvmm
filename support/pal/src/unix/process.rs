@@ -47,6 +47,7 @@ pub enum SandboxFailureMode {
 #[derive(Default)]
 pub struct LinuxBuilder<'a> {
     clone_flags: libc::c_int,
+    self_map_user_namespace: bool,
     vfork: bool,
     setsid: bool,
     sandbox_failure_mode: SandboxFailureMode,
@@ -259,6 +260,23 @@ impl<'a> Builder<'a> {
     #[cfg(target_os = "linux")]
     pub fn set_vfork(&mut self, vfork: bool) -> &mut Self {
         self.linux_builder.vfork = vfork;
+        self
+    }
+
+    /// Sets the namespace flags passed to `clone` when creating the process.
+    #[cfg(target_os = "linux")]
+    pub fn set_clone_flags(&mut self, flags: libc::c_int) -> &mut Self {
+        self.linux_builder.clone_flags = flags;
+        self
+    }
+
+    /// Maps user and group ID 0 in a new user namespace to the spawning
+    /// process's effective user and group IDs before executing the process.
+    ///
+    /// This requires [`libc::CLONE_NEWUSER`] in the configured clone flags.
+    #[cfg(target_os = "linux")]
+    pub fn set_user_namespace_self_map(&mut self, enabled: bool) -> &mut Self {
+        self.linux_builder.self_map_user_namespace = enabled;
         self
     }
 
@@ -519,6 +537,50 @@ mod tests {
         {
             assert_eq!(child.wait().unwrap().code().unwrap(), 0);
         }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "sandbox_tests"))]
+    fn test_user_namespace_self_map_with_vfork() {
+        use super::Stdio;
+        use std::io::BufRead;
+        use std::io::BufReader;
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixStream;
+
+        let (output, child_output) = UnixStream::pair().unwrap();
+        let mut cmd = Builder::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("id -u; id -g; sleep 30")
+            .stdout(Stdio::Fd(child_output.as_fd()))
+            .set_clone_flags(libc::CLONE_NEWUSER)
+            .set_user_namespace_self_map(true);
+
+        let mut child = cmd.spawn().unwrap();
+        drop(child_output);
+
+        let mut output = BufReader::new(output);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "0\n");
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "0\n");
+
+        // SAFETY: geteuid and getegid have no safety requirements.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        assert_eq!(
+            std::fs::read_to_string(format!("/proc/{}/uid_map", child.id())).unwrap(),
+            format!("         0 {uid:10}          1\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("/proc/{}/gid_map", child.id())).unwrap(),
+            format!("         0 {gid:10}          1\n")
+        );
+
+        // SAFETY: child.id() names the live process spawned above.
+        assert_eq!(unsafe { libc::kill(child.id(), libc::SIGKILL) }, 0);
+        child.wait().unwrap();
     }
 
     #[test]

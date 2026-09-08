@@ -17,6 +17,39 @@ use std::ffi::CString;
 use std::io;
 use std::os::unix::prelude::*;
 
+const ID_MAP_CAPACITY: usize = 32;
+
+#[derive(Clone, Copy)]
+struct IdMap {
+    bytes: [u8; ID_MAP_CAPACITY],
+    len: usize,
+}
+
+impl IdMap {
+    fn new(outer_id: u32) -> Self {
+        let mut bytes = [0; ID_MAP_CAPACITY];
+        bytes[0] = b'0';
+        bytes[1] = b' ';
+        let mut index = 2;
+        let mut divisor = 1_000_000_000;
+        let mut started = false;
+        while divisor != 0 {
+            let digit = (outer_id / divisor) % 10;
+            if digit != 0 || started || divisor == 1 {
+                bytes[index] = b'0' + digit as u8;
+                index += 1;
+                started = true;
+            }
+            divisor /= 10;
+        }
+        bytes[index..index + 3].copy_from_slice(b" 1\n");
+        Self {
+            bytes,
+            len: index + 3,
+        }
+    }
+}
+
 struct CloneContext<'a> {
     executable: &'a CStr,
     argv: &'a [*const libc::c_char],
@@ -27,6 +60,7 @@ struct CloneContext<'a> {
     sandbox_failure_mode: SandboxFailureMode,
     setsid: bool,
     controlling_terminal: Option<BorrowedFd<'a>>,
+    user_namespace_maps: Option<(IdMap, IdMap)>,
     uid: Option<libc::uid_t>,
     gid: Option<libc::uid_t>,
     permitted_capabilities: Option<CapsHashSet>,
@@ -44,6 +78,15 @@ impl Builder<'_> {
         envp: &[CString],
         fd_ops: &mut [(i32, FdOp)],
     ) -> io::Result<Child> {
+        if self.linux_builder.self_map_user_namespace
+            && self.linux_builder.clone_flags & libc::CLONE_NEWUSER == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "user namespace self-mapping requires CLONE_NEWUSER",
+            ));
+        }
+
         let mut landlock_rules = None;
         if let Some(lr) = &self.linux_builder.landlock_rules {
             landlock_rules = Some(lr.try_clone()?);
@@ -62,6 +105,11 @@ impl Builder<'_> {
             sandbox_failure_mode: self.linux_builder.sandbox_failure_mode,
             setsid: self.linux_builder.setsid,
             controlling_terminal: self.linux_builder.controlling_terminal,
+            user_namespace_maps: self.linux_builder.self_map_user_namespace.then(|| {
+                // SAFETY: geteuid and getegid have no safety requirements.
+                let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+                (IdMap::new(uid), IdMap::new(gid))
+            }),
             uid: self.uid,
             gid: self.gid,
             permitted_capabilities: self.linux_builder.permitted_capabilities.clone(),
@@ -187,6 +235,18 @@ extern "C" fn clone_cb(context: *mut libc::c_void) -> libc::c_int {
     // SAFETY: Context is temporarily owned by this function, and we know
     // we were passed a valid pointer.
     let context = unsafe { &mut *(context.cast::<CloneContext<'_>>()) };
+
+    if let Some((uid_map, gid_map)) = context.user_namespace_maps {
+        if write_proc_file(c"/proc/self/setgroups", b"deny\n") < 0 {
+            return errno().0;
+        }
+        if write_proc_file(c"/proc/self/uid_map", &uid_map.bytes[..uid_map.len]) < 0 {
+            return errno().0;
+        }
+        if write_proc_file(c"/proc/self/gid_map", &gid_map.bytes[..gid_map.len]) < 0 {
+            return errno().0;
+        }
+    }
 
     if context.setsid {
         // SAFETY: setsid has no safety requirements.
@@ -337,8 +397,52 @@ extern "C" fn clone_cb(context: *mut libc::c_void) -> libc::c_int {
     255
 }
 
+fn write_proc_file(path: &CStr, value: &[u8]) -> libc::c_int {
+    // SAFETY: path is NUL-terminated and points to a procfs control file.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return -1;
+    }
+
+    let mut written = 0;
+    while written < value.len() {
+        // SAFETY: fd is open and the remaining slice is valid for reads.
+        let result =
+            unsafe { libc::write(fd, value[written..].as_ptr().cast(), value.len() - written) };
+        if result <= 0 {
+            let saved_errno = if result == 0 { libc::EIO } else { errno().0 };
+            // SAFETY: fd is open and owned by this function.
+            unsafe { libc::close(fd) };
+            // SAFETY: assigning errno restores the write failure for the caller.
+            unsafe { *libc::__errno_location() = saved_errno };
+            return -1;
+        }
+        written += result as usize;
+    }
+
+    // SAFETY: fd is open and owned by this function.
+    unsafe { libc::close(fd) }
+}
+
 impl AsFd for Child {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.pidfd.as_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IdMap;
+
+    #[test]
+    fn formats_single_id_map() {
+        for (id, expected) in [
+            (0, "0 0 1\n"),
+            (1000, "0 1000 1\n"),
+            (u32::MAX, "0 4294967295 1\n"),
+        ] {
+            let map = IdMap::new(id);
+            assert_eq!(&map.bytes[..map.len], expected.as_bytes());
+        }
     }
 }
