@@ -33,12 +33,15 @@ impl SandboxRole {
     }
 
     fn profile(self) -> sandbox::Profile {
-        sandbox::profiles::minimal()
+        let profile = sandbox::profiles::minimal()
             .name(self.name())
             .read("/usr")
             .read("/etc")
-            .read("/dev")
-            .build()
+            .read("/dev");
+        match self {
+            Self::Vm => profile.syscalls(sandbox::Syscalls::Deny(&["kill"])).build(),
+            Self::Tpm => profile.build(),
+        }
     }
 }
 
@@ -77,6 +80,7 @@ fn sandbox_role_from_args() -> anyhow::Result<Option<SandboxRole>> {
 #[cfg(target_os = "linux")]
 struct LinuxSandboxProfile {
     clone_flags: i32,
+    self_map_user_namespace: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -84,7 +88,7 @@ impl mesh_process::SandboxProfile for LinuxSandboxProfile {
     fn apply(&mut self, builder: &mut pal::unix::process::Builder<'_>) {
         builder
             .set_clone_flags(self.clone_flags)
-            .set_user_namespace_self_map(true);
+            .set_user_namespace_self_map(self.self_map_user_namespace);
     }
 }
 
@@ -164,7 +168,10 @@ impl VmmMesh {
                         .context("sandbox clone flags do not fit in i32")?;
                     ProcessConfig::new_with_sandbox(
                         role.name(),
-                        Box::new(LinuxSandboxProfile { clone_flags }),
+                        Box::new(LinuxSandboxProfile {
+                            clone_flags,
+                            self_map_user_namespace: clone_flags != 0,
+                        }),
                     )
                     .args([format!("{SANDBOX_ROLE_ARG}{}", role.name())])
                     .stderr(log_file)
