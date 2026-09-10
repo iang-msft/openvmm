@@ -255,6 +255,7 @@ pub fn nr_for_name(name: &str) -> Option<i64> {
         "sigaltstack" => libc::SYS_sigaltstack,
         "execve" => libc::SYS_execve,
         "wait4" => libc::SYS_wait4,
+        "mount" => libc::SYS_mount,
         "kill" => libc::SYS_kill,
         "tkill" => libc::SYS_tkill,
         "tgkill" => libc::SYS_tgkill,
@@ -274,8 +275,10 @@ pub fn nr_for_name(name: &str) -> Option<i64> {
         "pwrite64" => libc::SYS_pwrite64,
         "close" => libc::SYS_close,
         "openat" => libc::SYS_openat,
+        "ftruncate" => libc::SYS_ftruncate,
         "fstat" => libc::SYS_fstat,
         "newfstatat" => libc::SYS_newfstatat,
+        "statx" => libc::SYS_statx,
         "lseek" => libc::SYS_lseek,
         "ioctl" => libc::SYS_ioctl,
         "fcntl" => libc::SYS_fcntl,
@@ -286,6 +289,9 @@ pub fn nr_for_name(name: &str) -> Option<i64> {
         "epoll_create1" => libc::SYS_epoll_create1,
         "epoll_ctl" => libc::SYS_epoll_ctl,
         "epoll_pwait" => libc::SYS_epoll_pwait,
+        "eventfd2" => libc::SYS_eventfd2,
+        "timerfd_create" => libc::SYS_timerfd_create,
+        "timerfd_settime" => libc::SYS_timerfd_settime,
         "ppoll" => libc::SYS_ppoll,
         "pselect6" => libc::SYS_pselect6,
         // Directory / metadata
@@ -303,6 +309,7 @@ pub fn nr_for_name(name: &str) -> Option<i64> {
         "sched_getaffinity" => libc::SYS_sched_getaffinity,
         "set_tid_address" => libc::SYS_set_tid_address,
         "rseq" => libc::SYS_rseq,
+        "prlimit64" => libc::SYS_prlimit64,
         // Time
         "clock_gettime" => libc::SYS_clock_gettime,
         "clock_getres" => libc::SYS_clock_getres,
@@ -416,6 +423,72 @@ pub fn apply_denylist(extra_deny_names: &[&str], deny_action: SeccompAction) -> 
     apply_filter(&clone3)
 }
 
+/// Build a default-deny allowlist filter.
+///
+/// Ordinary listed syscalls are allowed unconditionally. Security-sensitive
+/// syscalls retain argument-level restrictions: `clone` may not create new
+/// namespaces, and `prctl` is limited to process-name operations. `clone3` is
+/// allowed by this filter only so a stacked filter can return `ENOSYS` and
+/// force libc to fall back to the argument-filtered `clone`.
+pub fn build_allowlist_filter(
+    allowed_nrs: &[i64],
+    deny_action: SeccompAction,
+) -> io::Result<BpfProgram> {
+    let arch = target_arch()?;
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+
+    for nr in allowed_nrs.iter().copied() {
+        let syscall_rules = match nr {
+            libc::SYS_clone => clone_allow_rules()?,
+            libc::SYS_prctl => prctl_allow_rules()?,
+            _ => Vec::new(),
+        };
+        rules.insert(nr, syscall_rules);
+    }
+
+    rules.insert(libc::SYS_clone3, Vec::new());
+
+    finalize_filter(rules, deny_action, SeccompAction::Allow, arch)
+}
+
+/// Resolve and apply a deny-by-default syscall allowlist.
+///
+/// The mandatory dangerous-syscall set is an immutable upper bound: a profile
+/// cannot re-enable one of those syscalls. Survival syscalls must be named
+/// explicitly so the profile remains a complete, auditable description.
+pub fn apply_allowlist(allow_names: &[&str], deny_action: SeccompAction) -> io::Result<()> {
+    let mandatory_denied = mandatory_deny_syscall_nrs();
+    let survival = survival_syscall_nrs();
+    let mut allowed = Vec::with_capacity(allow_names.len());
+
+    for name in allow_names {
+        let nr = nr_for_name(name).ok_or_else(|| {
+            io::Error::other(format!("unknown syscall name in allowlist: {name:?}"))
+        })?;
+        if mandatory_denied.contains(&nr) {
+            return Err(io::Error::other(format!(
+                "syscall {name:?} is part of the mandatory deny set and cannot be allowed"
+            )));
+        }
+        if !allowed.contains(&nr) {
+            allowed.push(nr);
+        }
+    }
+
+    for nr in survival {
+        if !allowed.contains(&nr) {
+            return Err(io::Error::other(format!(
+                "allowlist must include survival syscall number {nr}"
+            )));
+        }
+    }
+
+    let clone3 = build_clone3_enosys_filter()?;
+    apply_filter(&clone3)?;
+    let filter = build_allowlist_filter(&allowed, deny_action)?;
+    apply_filter(&filter)
+}
+
 fn finalize_filter(
     rules: BTreeMap<i64, Vec<SeccompRule>>,
     mismatch_action: SeccompAction,
@@ -473,6 +546,30 @@ fn clone_deny_rules() -> io::Result<Vec<SeccompRule>> {
     Ok(rules)
 }
 
+/// Allow only pthread-style `clone` calls that request `CLONE_THREAD` and do
+/// not request a new namespace.
+fn clone_allow_rules() -> io::Result<Vec<SeccompRule>> {
+    Ok(vec![
+        SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::MaskedEq(CLONE_NEW_MASK),
+                0,
+            )
+            .map_err(|e| io::Error::other(format!("seccomp condition: {e}")))?,
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::MaskedEq(libc::CLONE_THREAD as u64),
+                libc::CLONE_THREAD as u64,
+            )
+            .map_err(|e| io::Error::other(format!("seccomp condition: {e}")))?,
+        ])
+        .map_err(|e| io::Error::other(format!("seccomp rule: {e}")))?,
+    ])
+}
+
 /// `prctl` — deny the `PR_SET_MM` subcommand; every other subcommand falls
 /// through to the default allow.
 fn prctl_deny_rules() -> io::Result<Vec<SeccompRule>> {
@@ -483,6 +580,25 @@ fn prctl_deny_rules() -> io::Result<Vec<SeccompRule>> {
         ])
         .map_err(|e| io::Error::other(format!("seccomp rule: {e}")))?,
     ])
+}
+
+/// Permit only the process-name operations used by worker thread builders.
+fn prctl_allow_rules() -> io::Result<Vec<SeccompRule>> {
+    [libc::PR_SET_NAME, libc::PR_GET_NAME]
+        .into_iter()
+        .map(|operation| {
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    operation as u64,
+                )
+                .map_err(|e| io::Error::other(format!("seccomp condition: {e}")))?,
+            ])
+            .map_err(|e| io::Error::other(format!("seccomp rule: {e}")))
+        })
+        .collect()
 }
 
 /// `socket` — deny the `AF_PACKET` address family; every other family falls
@@ -506,6 +622,7 @@ fn socket_deny_rules() -> io::Result<Vec<SeccompRule>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use test_with_tracing::test;
 
     #[test]
@@ -536,7 +653,9 @@ mod tests {
         // sandbox integration tests in a subprocess.
         ioctl_deny_rules().expect("ioctl rules");
         clone_deny_rules().expect("clone rules");
+        clone_allow_rules().expect("clone allow rules");
         prctl_deny_rules().expect("prctl rules");
+        prctl_allow_rules().expect("prctl allow rules");
         socket_deny_rules().expect("socket rules");
     }
 
@@ -560,5 +679,83 @@ mod tests {
         let bpf = build_denylist_filter(nrs, SeccompAction::Errno(libc::EPERM as u32))
             .expect("should build denylist filter");
         assert!(!bpf.is_empty());
+    }
+
+    #[test]
+    fn allowlist_filter_builds() {
+        let nrs = [
+            libc::SYS_exit,
+            libc::SYS_exit_group,
+            libc::SYS_rt_sigreturn,
+            libc::SYS_restart_syscall,
+            libc::SYS_read,
+            libc::SYS_clone,
+            libc::SYS_prctl,
+        ];
+        let bpf = build_allowlist_filter(&nrs, SeccompAction::Errno(libc::EPERM as u32))
+            .expect("should build allowlist filter");
+        assert!(!bpf.is_empty());
+    }
+
+    #[test]
+    fn allowlist_rejects_mandatory_denies_before_installing() {
+        let err = apply_allowlist(
+            &[
+                "exit",
+                "exit_group",
+                "rt_sigreturn",
+                "restart_syscall",
+                "mount",
+            ],
+            SeccompAction::Errno(libc::EPERM as u32),
+        )
+        .expect_err("mount must remain denied");
+        assert!(err.to_string().contains("mandatory deny"));
+    }
+
+    #[test]
+    fn allowlist_enforces_default_deny() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unix::seccomp::tests::helper_allowlist_enforces_default_deny",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("failed to spawn seccomp helper");
+        assert!(
+            output.status.success(),
+            "seccomp helper failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn helper_allowlist_enforces_default_deny() {
+        crate::unix::hardening::set_no_new_privs().unwrap();
+        apply_allowlist(
+            &[
+                "exit",
+                "exit_group",
+                "rt_sigreturn",
+                "restart_syscall",
+                "getpid",
+            ],
+            SeccompAction::Errno(libc::EPERM as u32),
+        )
+        .unwrap();
+
+        // SAFETY: Both calls take no arguments and are used only to inspect
+        // the seccomp filter's return values.
+        let allowed = unsafe { libc::syscall(libc::SYS_getpid) };
+        // SAFETY: See above.
+        let denied = unsafe { libc::syscall(libc::SYS_getppid) };
+        let errno = io::Error::last_os_error().raw_os_error();
+        let status = i32::from(allowed <= 0 || denied != -1 || errno != Some(libc::EPERM));
+        // SAFETY: This helper is a subprocess with no cleanup obligations.
+        unsafe { libc::_exit(status) }
     }
 }

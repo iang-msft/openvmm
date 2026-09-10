@@ -139,7 +139,8 @@ impl Builder {
     /// [`Syscalls::Unfiltered`] (no seccomp filter). [`Syscalls::Deny`]
     /// installs a seccomp filter that blocks the crate's built-in set of
     /// dangerous, namespace-escape, and historically CVE-prone syscalls, plus
-    /// any additional syscalls named in the list.
+    /// any additional syscalls named in the list. [`Syscalls::Allow`] instead
+    /// denies every syscall not named in the list.
     pub fn syscalls(mut self, policy: Syscalls) -> Self {
         self.inner.syscalls = policy;
         self
@@ -177,11 +178,9 @@ pub enum Network {
 
 /// Syscall-filtering policy (Linux; opt-in per worker class).
 ///
-/// The crate uses a **denylist** model rather than an allowlist: a worker's
-/// full set of *needed* syscalls cannot be reliably enumerated, so the filter
-/// instead blocks a curated set of syscalls that a sandboxed worker never
-/// legitimately needs and that are known namespace-escape or kernel-CVE
-/// vectors.
+/// A worker can use the conservative [`Syscalls::Deny`] baseline or opt into a
+/// deny-by-default [`Syscalls::Allow`] policy when its complete runtime surface
+/// has been measured.
 #[derive(Debug, Clone, Default)]
 pub enum Syscalls {
     /// Install no seccomp filter. The worker retains the ambient syscall
@@ -197,6 +196,14 @@ pub enum Syscalls {
     /// just the built-in baseline. Unknown names are a hard error at apply
     /// time.
     Deny(&'static [&'static str]),
+    /// Deny every syscall except those named here.
+    ///
+    /// The built-in dangerous set remains forbidden even if a name appears in
+    /// this list. Security-sensitive syscalls such as `clone` and `prctl`
+    /// retain argument-level restrictions. `clone3` is forced to `ENOSYS` so
+    /// libc falls back to the argument-filtered `clone`. Unknown names are a
+    /// hard error at apply time.
+    Allow(&'static [&'static str]),
 }
 
 /// An opaque, named platform capability, constructed from crate-provided
@@ -371,6 +378,17 @@ mod tests {
         assert!(matches!(
             profile.inner.syscalls,
             Syscalls::Deny(&["socket"])
+        ));
+    }
+
+    #[test]
+    fn syscalls_allow_is_stored() {
+        let profile = Profile::deny_all()
+            .syscalls(Syscalls::Allow(&["read", "write"]))
+            .build();
+        assert!(matches!(
+            profile.inner.syscalls,
+            Syscalls::Allow(&["read", "write"])
         ));
     }
 }

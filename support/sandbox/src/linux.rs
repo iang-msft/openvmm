@@ -24,8 +24,8 @@
 //! namespace, ABI-degraded on older kernels per D11/D16) logs and continues on
 //! failure; the mount namespace remains the primary FS boundary. **Seccomp** is
 //! *opt-in* per worker class (D13) — the deny-all default installs no filter —
-//! but once a profile opts in with [`Syscalls::Deny`], applying it is required
-//! and a failure aborts.
+//! but once a profile opts in with [`Syscalls::Deny`] or [`Syscalls::Allow`],
+//! applying it is required and a failure aborts.
 
 use crate::Error;
 use crate::profile::Access;
@@ -86,10 +86,17 @@ pub fn apply(profile: &Profile) -> Result<(), Error> {
     hardening::set_no_new_privs().map_err(required("no_new_privs"))?;
 
     // Step 7 — seccomp, *opt-in* per worker class (design D13). The deny-all
-    // default (`Syscalls::Unfiltered`) installs no filter; an explicit
-    // `Syscalls::Deny` installs the dangerous-syscall baseline plus any extras.
-    if let Syscalls::Deny(names) = &p.syscalls {
-        seccomp::apply_denylist(names, seccomp_deny_action()).map_err(required("seccomp"))?;
+    // default (`Syscalls::Unfiltered`) installs no filter. Denylists extend the
+    // dangerous-syscall baseline; allowlists deny everything else while still
+    // refusing to re-enable anything from that baseline.
+    match &p.syscalls {
+        Syscalls::Unfiltered => {}
+        Syscalls::Deny(names) => {
+            seccomp::apply_denylist(names, seccomp_deny_action()).map_err(required("seccomp"))?;
+        }
+        Syscalls::Allow(names) => {
+            seccomp::apply_allowlist(names, seccomp_deny_action()).map_err(required("seccomp"))?;
+        }
     }
 
     tracing::debug!(profile = p.name, "sandbox applied");

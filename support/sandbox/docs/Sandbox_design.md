@@ -713,7 +713,11 @@ impl Builder {
 /// `landlock::`, `seccompiler::`, `caps::`, or `windows_sys::` type
 /// ever crosses this surface (R-S11).
 pub enum Network { None, Loopback, Unrestricted }
-pub enum Syscalls { Unfiltered, Allow(&'static [&'static str]) }
+pub enum Syscalls {
+    Unfiltered,
+    Deny(&'static [&'static str]),
+    Allow(&'static [&'static str]),
+}
 /// An opaque, named platform capability, constructed from
 /// crate-provided constants (`Capability::LPAC_COM`, …). The consumer
 /// never sees the underlying SID or grant.
@@ -853,11 +857,11 @@ pub fn prepare(
 /// half (Job Object, mitigation policies, token strip). Returns the
 /// pre-Mesh `Handles`.
 ///
-/// The seccomp allowlist installed here is the profile's *complete*
-/// filter. Because seccomp is monotonic and `apply` runs first, that
-/// allowlist is necessarily the union of the worker's init-time and
-/// steady-state syscalls; shedding the init-only surface afterward is
-/// the job of the optional `tighten` (R-F5).
+/// A profile may install either the dangerous-syscall deny baseline or a
+/// complete seccomp allowlist. An allowlist is necessarily the union of the
+/// worker's init-time and steady-state syscalls because `apply` runs first;
+/// shedding init-only surface afterward is the job of optional `tighten`
+/// (R-F5). The mandatory dangerous set remains denied in both modes.
 ///
 /// No-op returning `Handles::empty()` when no grant is present — the
 /// single-process / dev path, mirroring how `try_run_mesh_host`
