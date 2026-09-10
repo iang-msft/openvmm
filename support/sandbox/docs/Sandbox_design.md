@@ -291,7 +291,7 @@ them.
 | **D6** | **Public vocabulary is intent-level and platform-neutral.** No `landlock` / `seccompiler` / `caps` / `windows-sys` types cross the public API. | TSD Topic 9 |
 | **D7** | **Backends are `cfg`-gated modules inside one crate.** | TSD Topic 9 |
 | **D8** | **Broker-and-handles is mandatory.** Workers see resources only as inherited FDs / HANDLEs. Deferred: broker server and seccomp user-notify. | TSD Topic 5 |
-| **D9** | **Handle hygiene is mandatory.** `FD_CLOEXEC` / non-inheritable by default, explicit allowlist, `close_range` belt-and-suspenders on Linux, `HANDLE_LIST` on Windows. | TSD Topic 12 |
+| **D9** | **Handle hygiene is mandatory.** `FD_CLOEXEC` / non-inheritable by default, explicit allowlist, pre-`execve` `close_range` enforcement on Linux, `HANDLE_LIST` on Windows. | TSD Topic 12 |
 | **D10** | **`mesh_process` stays policy-agnostic.** OpenVMM owns role selection and adapts `SandboxProcessConfig` to the existing generic process-builder hook; Mesh worker names are not security selectors. | TSD Topic 11 |
 | **D11** | **Mount namespace + bind mounts + `pivot_root` is the primary Linux FS isolation mechanism.** Landlock is a supplement, applied opportunistically with ABI-aware degradation. | TSD Topic 4 ("team preference, load-bearing") |
 | **D12** | **Empty network namespace is the primary Linux network restriction.** Landlock network needs ABI 4 / kernel 6.7, above both baselines. | TSD Topic 4 |
@@ -445,13 +445,13 @@ not both at once.
 ```mermaid
 graph TB
     subgraph CTRL["STAGE 1 · prepare — control process (trusted · full ambient authority)"]
-        PL["<b>Linux</b> — thin<br/>mark allowlisted FDs inheritable · CLOEXEC the rest<br/>serialize Grant → SANDBOX_GRANT env · carry identity"]
+        PL["<b>Linux</b> — thin<br/>construct fixed child-FD allowlist<br/>serialize Grant → SANDBOX_GRANT env · carry identity"]
         PW["<b>Windows</b> — heavy (LPAC built here)<br/>AppContainer SID · capability SIDs<br/>STARTUPINFOEX: LPAC opt-out · HANDLE_LIST · mitigations<br/>serialize Grant → SANDBOX_GRANT env"]
     end
 
     subgraph CHILD["Child process — trusted bootstrap until confinement; untrusted role code afterward"]
         AP["<b>apply()</b> · FIRST STATEMENT of main()<br/>trusted-computing-base phase until declared confinement is complete"]
-        APL["<b>Linux</b> — the entire sandbox<br/>unshare(user/mnt/net/ipc/uts/cgroup)<br/>uid_map/gid_map · bind mounts · pivot_root<br/>close_range · caps=∅ + locked securebits<br/>setgid/setuid · NO_NEW_PRIVS<br/>Landlock · seccomp (init ∪ steady-state)"]
+        APL["<b>Linux</b> — pre-exec PAL callback maps allowed FDs<br/>and closes all others; apply then establishes<br/>namespaces · bind mounts · pivot_root<br/>caps=∅ + locked securebits · setgid/setuid<br/>NO_NEW_PRIVS · Landlock · seccomp"]
         APW["<b>Windows</b> — post-launch half only<br/>Job Object · post-launch mitigations<br/>privilege strip · deny-only groups · integrity level"]
         SETUP["SANDBOX BOUNDARY IS NOW ACTIVE<br/>&lt;worker process setup&gt;<br/>attach Mesh · receive granted FDs + OsResources<br/>map guest memory · spawn worker threads"]
         TI["<b>tighten()</b> · optional · after setup"]
@@ -626,7 +626,7 @@ graph TB
     end
 
     subgraph LinuxBackend["cfg(target_os = &quot;linux&quot;)"]
-        LP["<b>apply</b> — worker main()<br/>unshare · uid_map · mounts · pivot_root<br/>close_range · caps + securebits<br/>setgid/setuid · DUMPABLE · PDEATHSIG<br/>NO_NEW_PRIVS · Landlock · seccomp"]
+        LP["<b>PAL clone callback</b> — map allowed FDs · close_range<br/><b>apply</b> — worker main()<br/>unshare · uid_map · mounts · pivot_root<br/>caps + securebits · setgid/setuid<br/>DUMPABLE · PDEATHSIG · NO_NEW_PRIVS<br/>Landlock · seccomp"]
     end
 
     subgraph WindowsBackend["cfg(target_os = &quot;windows&quot;)"]
@@ -1107,7 +1107,7 @@ alternative so it does not get relitigated.
 | `MS_REC \| MS_PRIVATE` on `/` before `pivot_root` | Hard prerequisite of `pivot_root`; also stops mount events propagating back out | `apply` |
 | `/proc` with `hidepid=2,subset=pid` | Hides other processes' `/proc` entries — a component of R-S6 | `apply` |
 | `/sys` read-only, or omitted entirely | Reduces attack surface | `apply` |
-| `close_range(max_allowlisted + 1, u32::MAX, 0)` | Belt-and-suspenders for R-S7 | `apply` |
+| `close_range` outside the fixed child-FD allowlist | Prevents any unexpected descriptor from crossing `execve` (R-S7) | `clone` |
 | `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)` | Detaches the inherited session keyring (Kerberos tickets, MSI tokens, NFS auth). **Opportunistic** — blocked by Docker's default seccomp, which is acceptable since container keyrings are typically empty | `apply` |
 | `prctl(PR_SET_DUMPABLE, 0)` | Blocks same-UID `ptrace` at Yama level 0 and locks `/proc/PID/` ownership to root. Component of R-S6. **Must run after the credential drop** (C8) | `apply` |
 | `prctl(PR_SET_PDEATHSIG, SIGKILL)` | Worker dies with its control process. **Set in `apply`, after the credential drop clears it** (C9) | `apply` |
@@ -1130,7 +1130,8 @@ callback; `apply` = worker startup, single-threaded and freshly execve'd;
 
 | Primitive | Stage | Class | Ordering constraint |
 |---|---|---|---|
-| Mark non-allowlisted FDs `FD_CLOEXEC` | `prepare` | R | Before spawn |
+| Create source FDs with `O_CLOEXEC` or an equivalent atomic flag | normal operation | R | At FD creation; defense in depth against every spawn path |
+| Compute the fixed child-FD allowlist | `prepare` | R | Before spawn |
 | Serialize `Grant` into `SANDBOX_GRANT` env | `prepare` | R | Before spawn |
 | Read + verify `Grant` | `apply` | R | **First**, before anything else |
 | `setrlimit` bundle | `apply` | R | Early; before the credential drop |
@@ -1141,7 +1142,7 @@ callback; `apply` = worker startup, single-threaded and freshly execve'd;
 | Bind mounts + `MS_BIND\|MS_REMOUNT` flag fixups | `apply` | R | Remount is required: the original `MS_BIND` does not carry `NOSUID`/`NODEV`/`NOEXEC` |
 | Mount `/proc` (`hidepid=2,subset=pid`), `/sys` ro | `apply` | O | Within the new root |
 | `pivot_root` + `umount2(".", MNT_DETACH)` + `chdir("/")` | `apply` | R | After the new root is fully populated |
-| `close_range` above the allowlist | `apply` | R | After the grant is read; before seccomp could deny it |
+| Map allowlisted FDs, then `close_range` every other FD | `clone` | R | In PAL's private child FD table, after pre-exec FD consumers and before `execve` |
 | `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)` | `apply` | O | — |
 | Clear ambient caps → `capset` zero → `PR_CAPBSET_DROP` all | `apply` | R | **After** mounts, which may need `CAP_SYS_ADMIN` |
 | `prctl(PR_SET_SECUREBITS, ...LOCKED)` | `apply` | R | Immediately after the capability drop |
@@ -1195,6 +1196,7 @@ sequenceDiagram
     autonumber
     participant CP as Control Process<br/>(multi-threaded)
     participant K as Linux kernel
+    participant C as Child<br/>(pre-exec PAL callback)
     participant W as Worker<br/>(post-execve, single-threaded main)
 
     rect rgb(232, 244, 253)
@@ -1202,14 +1204,15 @@ sequenceDiagram
         CP->>CP: grant = Grant { wire_version, identity, handles }
         CP->>CP: sandbox::prepare(&mut builder, profile, identity, handles)
         CP->>CP: encode grant → SANDBOX_GRANT env on builder
-        CP->>CP: FD_CLOEXEC on every non-allowlisted FD
-        CP->>K: clone(NEWUSER|NEWNS[|NEWNET], CLONE_VM|CLONE_VFORK)
-        K->>K: write setgroups, uid_map, gid_map
+        CP->>C: clone(NEWUSER|NEWNS[|NEWNET], CLONE_VM|CLONE_VFORK)
+        C->>K: write setgroups, uid_map, gid_map
+        C->>C: map allowlisted FDs to fixed targets
+        C->>K: close_range(all non-allowlisted FDs)
     end
 
     rect rgb(240, 255, 244)
-        Note over K,W: B — execve
-        K->>W: execve(worker, argv, envp)<br/>SANDBOX_GRANT in env; mesh fd (IPC_FD=3) inherited
+        Note over C,W: B — execve
+        C->>W: execve(worker, argv, envp)<br/>SANDBOX_GRANT in env; mesh fd (IPC_FD=3) inherited
         Note right of W: main() — single-threaded, fresh heap.<br/>Normal Rust from here: no fork, no ASYNC-SIGNAL zone.
     end
 
@@ -1221,7 +1224,6 @@ sequenceDiagram
         W->>K: bind mounts + MS_REMOUNT with NOSUID|NODEV|NOEXEC|RDONLY
         W->>K: mount /proc (hidepid=2,subset=pid); /sys ro
         W->>K: pivot_root; umount2(".", MNT_DETACH); chdir("/")
-        W->>K: close_range(above allowlist)
         W->>K: keyctl(JOIN_SESSION_KEYRING, NULL)
         W->>K: clear ambient; capset zero; PR_CAPBSET_DROP all
         W->>K: prctl(PR_SET_SECUREBITS, ...LOCKED)
@@ -1618,7 +1620,7 @@ the equivalent table in `Sandbox_architecture.md`.
 | `NetworkAccess::None` | Empty netns + optional seccomp `EAFNOSUPPORT` on `socket()` | `clone` + **`apply`** | **Omit** `internetClient`, `internetClientServer`, `privateNetworkClientServer` capability SIDs | **`prepare`** |
 | `NetworkAccess::LoopbackOnly` | Netns + bring `lo` up + seccomp allowlist for loopback binds | `clone` + **`apply`** | No network capability SIDs; Job Object network rate control | `prepare` + `apply` |
 | `NetworkAccess::Unrestricted` | Preserve the caller's network namespace | **`prepare`** | Not yet implemented | — |
-| `Handles::AllowlistOnly` | Parent `FD_CLOEXEC` sweep (`prepare`) + `close_range(max+1, MAX, 0)` (`apply`) | `prepare` + **`apply`** | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (mandatory) + parent `HANDLE_FLAG_INHERIT` sweep | **`prepare`** |
+| `Handles::AllowlistOnly` | Atomic `O_CLOEXEC` at creation + fixed target mapping and `close_range` in PAL's pre-exec child callback | `prepare` + **`clone`** | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (mandatory) + parent `HANDLE_FLAG_INHERIT` sweep | **`prepare`** |
 | `Privileges::DropAll` | clear ambient → `capset` zero → `PR_CAPBSET_DROP` all → locked securebits | **`apply`** | `AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)` | **`apply`** |
 | `Credentials::Uid(uid)/Gid(gid)` | uid_map/gid_map then `setgroups([])`→`setgid`→`setuid` | **`apply`** | AppContainer SID *is* the identity; `AdjustTokenGroups(SE_GROUP_USE_FOR_DENY_ONLY)` for residual groups | `prepare` + `apply` |
 | `NoNewPrivs` | `prctl(PR_SET_NO_NEW_PRIVS, 1)` — before the filters it enables | **`apply`** | Analogous LPAC token behavior | `prepare` (inherent) |
@@ -1683,24 +1685,25 @@ purpose is resolved by the message field, not by a handle tag.
 
 ### 10.2 Handle hygiene
 
-R-S7 is enforced on both sides of the spawn, on both platforms:
+R-S7 is enforced as part of process creation on both platforms:
 
-**Parent side, before the spawn (`prepare`):**
-
-| Linux | Windows |
-|---|---|
-| Set `FD_CLOEXEC` on every FD not in the allowlist | Clear `HANDLE_FLAG_INHERIT` on every handle not in the allowlist |
-| Assign allowlisted FDs to fixed, low numbers | Populate `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` |
-
-**Child side, in `apply`:**
+**Before cloning (`prepare` and normal FD creation):**
 
 | Linux | Windows |
 |---|---|
-| `close_range(max_allowlisted + 1, u32::MAX, 0)` | `ProcessStrictHandleCheckPolicy` (turns a bad-handle use into an immediate fault) |
+| Create source FDs with `O_CLOEXEC` or an equivalent atomic flag; compute fixed child targets | Clear `HANDLE_FLAG_INHERIT` on every handle not in the allowlist |
+| Pass the allowlist to the process builder | Populate `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` |
 
-The parent sweep is the primary mechanism; the child sweep catches
-anything the parent missed — most plausibly an FD opened by a
-library's background thread between the sweep and the spawn.
+**Child side, before executing the worker:**
+
+| Linux | Windows |
+|---|---|
+| PAL maps allowed FDs to fixed targets and uses `close_range` for every other descriptor | `ProcessStrictHandleCheckPolicy` (turns a bad-handle use into an immediate fault) |
+
+The Linux pre-exec close is the primary enforcement mechanism. It runs in the
+child's private FD table, so descriptors opened concurrently by another parent
+thread after `clone` cannot appear, and closure cannot affect the parent.
+Atomic CLOEXEC-at-creation remains defense in depth for all other spawn paths.
 
 **FD numbering — unchanged.** Mesh already fixes `IPC_FD = 3`
 (`support/mesh/mesh_process/src/lib.rs`) and the sandbox deliberately

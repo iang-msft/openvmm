@@ -18,11 +18,9 @@
 //!
 //! There is no grant envelope and no in-crate FD sweep. [`SandboxProcessConfig`]
 //! reports exactly which tagged handles must remain inheritable in
-//! [`SandboxProcessConfig::inherit_handles`]; the caller is responsible for
-//! keeping those inheritable and closing or marking every other descriptor
-//! close-on-exec before the child is reached. Doing it caller-side means the
-//! one process that owns the descriptor table is the one that decides what
-//! leaves it.
+//! [`SandboxProcessConfig::inherit_handles`]; the caller's process builder is
+//! responsible for mapping those handles to their child descriptor numbers
+//! and closing every other descriptor in the pre-exec child context.
 
 use crate::Error;
 use crate::profile::Profile;

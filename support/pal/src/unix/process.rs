@@ -48,6 +48,7 @@ pub enum SandboxFailureMode {
 pub struct LinuxBuilder<'a> {
     clone_flags: libc::c_int,
     self_map_user_namespace: bool,
+    inherited_fd_allowlist: Option<Vec<i32>>,
     vfork: bool,
     setsid: bool,
     sandbox_failure_mode: SandboxFailureMode,
@@ -277,6 +278,16 @@ impl<'a> Builder<'a> {
     #[cfg(target_os = "linux")]
     pub fn set_user_namespace_self_map(&mut self, enabled: bool) -> &mut Self {
         self.linux_builder.self_map_user_namespace = enabled;
+        self
+    }
+
+    /// Restricts the file descriptors inherited by the executed process.
+    ///
+    /// The listed descriptor numbers are retained. All other descriptors are
+    /// closed in the child immediately before executing the new process.
+    #[cfg(target_os = "linux")]
+    pub fn set_inherited_fd_allowlist(&mut self, fds: impl IntoIterator<Item = i32>) -> &mut Self {
+        self.linux_builder.inherited_fd_allowlist = Some(fds.into_iter().collect());
         self
     }
 
@@ -581,6 +592,78 @@ mod tests {
         // SAFETY: child.id() names the live process spawned above.
         assert_eq!(unsafe { libc::kill(child.id(), libc::SIGKILL) }, 0);
         child.wait().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_inherited_fd_allowlist() {
+        use std::io::Write;
+        use std::os::fd::AsFd;
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        use std::os::fd::RawFd;
+        use std::os::unix::net::UnixStream;
+
+        const ALLOWED_FD: RawFd = 10;
+
+        let (mut send, receive) = UnixStream::pair().unwrap();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: null is a valid descriptor and the returned descriptor is
+        // uniquely owned.
+        let leaked_fd = unsafe {
+            let fd = libc::fcntl(null.as_fd().as_raw_fd(), libc::F_DUPFD, 100);
+            assert!(fd >= 100);
+            OwnedFd::from_raw_fd(fd)
+        };
+
+        let mut cmd = Builder::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "unix::process::tests::helper_verify_inherited_fd_allowlist",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("PAL_ALLOWED_FD", ALLOWED_FD.to_string())
+        .env("PAL_LEAKED_FD", leaked_fd.as_raw_fd().to_string())
+        .dup_fd(receive.as_fd(), ALLOWED_FD)
+        .set_inherited_fd_allowlist([0, 1, 2, ALLOWED_FD]);
+
+        let mut child = cmd.spawn().unwrap();
+        drop(receive);
+        send.write_all(b"x").unwrap();
+        assert!(child.wait().unwrap().success());
+        // SAFETY: leaked_fd remains owned by this process.
+        assert!(unsafe { libc::fcntl(leaked_fd.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn helper_verify_inherited_fd_allowlist() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        use std::os::fd::RawFd;
+
+        let allowed_fd: RawFd = std::env::var("PAL_ALLOWED_FD").unwrap().parse().unwrap();
+        let leaked_fd: RawFd = std::env::var("PAL_LEAKED_FD").unwrap().parse().unwrap();
+
+        // SAFETY: the parent intentionally transferred ownership of this
+        // descriptor to the child at the configured target number.
+        let allowed = unsafe { OwnedFd::from_raw_fd(allowed_fd) };
+        let mut allowed = std::fs::File::from(allowed);
+        let mut byte = [0];
+        allowed.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [b'x']);
+
+        // SAFETY: F_GETFD only inspects the numeric descriptor.
+        let result = unsafe { libc::fcntl(leaked_fd, libc::F_GETFD) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
     }
 
     #[test]

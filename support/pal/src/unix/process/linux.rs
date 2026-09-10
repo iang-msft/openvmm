@@ -61,6 +61,7 @@ struct CloneContext<'a> {
     setsid: bool,
     controlling_terminal: Option<BorrowedFd<'a>>,
     user_namespace_maps: Option<(IdMap, IdMap)>,
+    fd_close_ranges: &'a [(u32, u32)],
     uid: Option<libc::uid_t>,
     gid: Option<libc::uid_t>,
     permitted_capabilities: Option<CapsHashSet>,
@@ -95,6 +96,13 @@ impl Builder<'_> {
         // Build the null-terminated arrays for exec.
         let argv = super::c_slice_to_pointers(&self.argv);
         let envp = super::c_slice_to_pointers(envp);
+        let fd_close_ranges = self
+            .linux_builder
+            .inherited_fd_allowlist
+            .as_deref()
+            .map(fd_close_ranges)
+            .transpose()?
+            .unwrap_or_default();
 
         let mut context = CloneContext {
             executable: &self.executable,
@@ -110,6 +118,7 @@ impl Builder<'_> {
                 let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
                 (IdMap::new(uid), IdMap::new(gid))
             }),
+            fd_close_ranges: &fd_close_ranges,
             uid: self.uid,
             gid: self.gid,
             permitted_capabilities: self.linux_builder.permitted_capabilities.clone(),
@@ -339,6 +348,14 @@ extern "C" fn clone_cb(context: *mut libc::c_void) -> libc::c_int {
         }
     }
 
+    for &(first, last) in context.fd_close_ranges {
+        // SAFETY: close_range takes integer bounds and affects only the
+        // calling process's file descriptor table.
+        if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) } < 0 {
+            return errno().0;
+        }
+    }
+
     if let Some(gid) = context.gid {
         // SAFETY: setresgid has no safety requirements.
         if unsafe { libc::setresgid(gid, gid, gid) } < 0 {
@@ -397,6 +414,38 @@ extern "C" fn clone_cb(context: *mut libc::c_void) -> libc::c_int {
     255
 }
 
+fn fd_close_ranges(allowlist: &[i32]) -> io::Result<Vec<(u32, u32)>> {
+    let mut allowlist = allowlist.to_vec();
+    allowlist.sort_unstable();
+
+    let mut ranges = Vec::new();
+    let mut first = 0;
+    let mut previous = None;
+    for fd in allowlist {
+        if fd < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inherited file descriptor allowlist contains a negative descriptor",
+            ));
+        }
+        if previous == Some(fd) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inherited file descriptor allowlist contains a duplicate descriptor",
+            ));
+        }
+
+        let fd = fd as u32;
+        if first < fd {
+            ranges.push((first, fd - 1));
+        }
+        first = fd + 1;
+        previous = Some(fd as i32);
+    }
+    ranges.push((first, u32::MAX));
+    Ok(ranges)
+}
+
 fn write_proc_file(path: &CStr, value: &[u8]) -> libc::c_int {
     // SAFETY: path is NUL-terminated and points to a procfs control file.
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
@@ -433,6 +482,29 @@ impl AsFd for Child {
 #[cfg(test)]
 mod tests {
     use super::IdMap;
+    use super::fd_close_ranges;
+
+    #[test]
+    fn computes_fd_close_ranges() {
+        assert_eq!(fd_close_ranges(&[]).unwrap(), [(0, u32::MAX)]);
+        assert_eq!(fd_close_ranges(&[0, 1, 2, 3]).unwrap(), [(4, u32::MAX)]);
+        assert_eq!(
+            fd_close_ranges(&[3, 0, 7]).unwrap(),
+            [(1, 2), (4, 6), (8, u32::MAX)]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_fd_allowlists() {
+        assert_eq!(
+            fd_close_ranges(&[-1]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            fd_close_ranges(&[3, 3]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn formats_single_id_map() {

@@ -939,6 +939,8 @@ impl MeshInner {
 
             if let Some(mut sandbox_profile) = config.sandbox_profile {
                 sandbox_profile.apply(&mut command);
+                #[cfg(target_os = "linux")]
+                command.set_inherited_fd_allowlist([0, 1, 2, IPC_FD]);
             }
 
             // Launch the child process on a separate thread to isolate
@@ -1021,7 +1023,25 @@ mod tests {
     use pal_async::DefaultDriver;
     use pal_async::async_test;
     use pal_async::task::Spawn;
+    #[cfg(target_os = "linux")]
+    use std::ffi::OsString;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsFd;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::FromRawFd;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::OwnedFd;
     use test_with_tracing::test;
+
+    #[cfg(target_os = "linux")]
+    struct NoopSandbox;
+
+    #[cfg(target_os = "linux")]
+    impl SandboxProfile for NoopSandbox {
+        fn apply(&mut self, _builder: &mut ProcessBuilder<'_>) {}
+    }
 
     #[async_test]
     async fn test_listen(driver: DefaultDriver) {
@@ -1056,5 +1076,73 @@ mod tests {
         drop(listener);
 
         mesh.shutdown().await;
+    }
+
+    #[async_test]
+    #[cfg(target_os = "linux")]
+    async fn sandboxed_host_closes_unlisted_fds(_driver: DefaultDriver) {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("fd-allowlist-result");
+        let null = File::open("/dev/null").unwrap();
+        // SAFETY: null is a valid descriptor and the returned descriptor is
+        // uniquely owned.
+        let leaked_fd = unsafe {
+            let fd = libc::fcntl(null.as_fd().as_raw_fd(), libc::F_DUPFD, 100);
+            assert!(fd >= 100);
+            OwnedFd::from_raw_fd(fd)
+        };
+
+        let mesh = Mesh::new("fd-allowlist-test".to_string()).unwrap();
+        mesh.launch_host(
+            ProcessConfig::new_with_sandbox("fd-allowlist-test", Box::new(NoopSandbox))
+                .process_name(std::env::current_exe().unwrap())
+                .skip_worker_arg(true)
+                .args([
+                    "--exact",
+                    "tests::helper_verify_sandboxed_host_fd_allowlist",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env([
+                    (
+                        OsString::from("MESH_TEST_LEAKED_FD"),
+                        OsString::from(leaked_fd.as_raw_fd().to_string()),
+                    ),
+                    (
+                        OsString::from("MESH_TEST_MARKER"),
+                        marker.clone().into_os_string(),
+                    ),
+                ]),
+            (),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..500 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "closed");
+        mesh.shutdown().await;
+    }
+
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn helper_verify_sandboxed_host_fd_allowlist() {
+        let leaked_fd = std::env::var("MESH_TEST_LEAKED_FD")
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: F_GETFD only inspects the numeric descriptor.
+        let result = unsafe { libc::fcntl(leaked_fd, libc::F_GETFD) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        std::fs::write(std::env::var_os("MESH_TEST_MARKER").unwrap(), "closed").unwrap();
     }
 }

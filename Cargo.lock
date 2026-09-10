@@ -4663,6 +4663,7 @@ dependencies = [
  "inspect",
  "inspect_rlimit",
  "inspect_task",
+ "libc",
  "mesh",
  "mesh_remote",
  "pal",

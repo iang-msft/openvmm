@@ -27,6 +27,7 @@ unicycle.workspace = true
 inspect_rlimit.workspace = true
 
 [dev-dependencies]
+libc.workspace = true
 tempfile.workspace = true
 test_with_tracing.workspace = true
 
