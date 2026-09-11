@@ -52,21 +52,6 @@ fn sandbox_role_from_args() -> anyhow::Result<Option<SandboxRole>> {
     Ok(role)
 }
 
-#[cfg(target_os = "linux")]
-struct LinuxSandboxProfile {
-    clone_flags: i32,
-    self_map_user_namespace: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl mesh_process::SandboxProfile for LinuxSandboxProfile {
-    fn apply(&mut self, builder: &mut pal::unix::process::Builder<'_>) {
-        builder
-            .set_clone_flags(self.clone_flags)
-            .set_user_namespace_self_map(self.self_map_user_namespace);
-    }
-}
-
 #[derive(Inspect)]
 pub(crate) struct VmmMesh {
     #[inspect(flatten)]
@@ -134,23 +119,9 @@ impl VmmMesh {
             let (host, runner) = mesh_worker::worker_host();
             #[cfg(target_os = "linux")]
             let process_config = match sandbox_role {
-                Some(role) => {
-                    let preparation =
-                        sandbox::prepare(&role.profile(), &sandbox::Identity::default(), &[])?;
-                    let clone_flags = preparation
-                        .clone_flags
-                        .try_into()
-                        .context("sandbox clone flags do not fit in i32")?;
-                    ProcessConfig::new_with_sandbox(
-                        role.name(),
-                        Box::new(LinuxSandboxProfile {
-                            clone_flags,
-                            self_map_user_namespace: clone_flags != 0,
-                        }),
-                    )
+                Some(role) => ProcessConfig::new_with_sandbox(role.name(), role.profile())
                     .args([format!("{SANDBOX_ROLE_ARG}{}", role.name())])
-                    .stderr(log_file)
-                }
+                    .stderr(log_file),
                 None => ProcessConfig::new(name).stderr(log_file),
             };
             #[cfg(not(target_os = "linux"))]

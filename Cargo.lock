@@ -4668,6 +4668,7 @@ dependencies = [
  "mesh_remote",
  "pal",
  "pal_async",
+ "sandbox",
  "slab",
  "tempfile",
  "test_with_tracing",

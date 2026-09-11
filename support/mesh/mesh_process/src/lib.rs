@@ -38,12 +38,8 @@ use mesh::rpc::FailableRpc;
 use mesh::rpc::RpcSend;
 #[cfg(unix)]
 use mesh_remote::InvitationAddress;
-#[cfg(unix)]
-use pal::unix::process::Builder as ProcessBuilder;
 #[cfg(windows)]
 use pal::windows::process;
-#[cfg(windows)]
-use pal::windows::process::Builder as ProcessBuilder;
 #[cfg(unix)]
 use pal_async::DefaultPool;
 use pal_async::task::Spawn;
@@ -279,23 +275,6 @@ pub struct Mesh {
     task: Task<()>,
 }
 
-/// Sandbox profile trait used for mesh hosts.
-pub trait SandboxProfile: Send {
-    /// Apply executes in the parent context and configures any sandbox
-    /// features that will be applied to the newly created process via
-    /// the pal builder object.
-    fn apply(&mut self, builder: &mut ProcessBuilder<'_>);
-
-    /// Finalize is intended to execute in the child process context after
-    /// application specific initialization is complete. It's optional as not
-    /// every sandbox profile will need to perform additional sandboxing.
-    /// In addition, the child will need to be aware enough to instantiate its
-    /// sandbox profile and invoke this method.
-    fn finalize(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
 /// Configuration for launching a new process in the mesh.
 pub struct ProcessConfig {
     name: String,
@@ -303,7 +282,9 @@ pub struct ProcessConfig {
     process_args: Vec<OsString>,
     stderr: Option<File>,
     skip_worker_arg: bool,
-    sandbox_profile: Option<Box<dyn SandboxProfile + Sync>>,
+    sandbox_profile: Option<sandbox::Profile>,
+    #[cfg(target_os = "linux")]
+    restrict_inherited_fds: bool,
     env_vars: Vec<(OsString, OsString)>,
 }
 
@@ -318,16 +299,15 @@ impl ProcessConfig {
             stderr: None,
             skip_worker_arg: false,
             sandbox_profile: None,
+            #[cfg(target_os = "linux")]
+            restrict_inherited_fds: false,
             env_vars: Vec::new(),
         }
     }
 
-    /// Returns a new process configuration using the current process as the
-    /// process name.
-    pub fn new_with_sandbox(
-        name: impl Into<String>,
-        sandbox_profile: Box<dyn SandboxProfile + Sync>,
-    ) -> Self {
+    /// Returns a new sandboxed process configuration using the current process
+    /// as the process name.
+    pub fn new_with_sandbox(name: impl Into<String>, sandbox_profile: sandbox::Profile) -> Self {
         Self {
             name: name.into(),
             process_name: None,
@@ -335,8 +315,18 @@ impl ProcessConfig {
             stderr: None,
             skip_worker_arg: false,
             sandbox_profile: Some(sandbox_profile),
+            #[cfg(target_os = "linux")]
+            restrict_inherited_fds: true,
             env_vars: Vec::new(),
         }
+    }
+
+    /// Restricts inherited Linux file descriptors to the fixed Mesh bootstrap
+    /// layout, independently of whether a sandbox profile is configured.
+    #[cfg(target_os = "linux")]
+    pub fn restrict_inherited_fds(mut self) -> Self {
+        self.restrict_inherited_fds = true;
+        self
     }
 
     /// Sets the process name.
@@ -841,6 +831,10 @@ impl MeshInner {
 
         #[cfg(windows)]
         let child = {
+            if config.sandbox_profile.is_some() {
+                anyhow::bail!("sandboxed Mesh hosts are not supported on Windows");
+            }
+
             let (invitation, handle) = self.node.invite(recv).context("mesh node invite error")?;
             node_id = invitation.node_id();
             let (credentials, directory) = invitation.into_parts();
@@ -876,10 +870,6 @@ impl MeshInner {
 
             if let Some(log_file) = config.stderr.as_ref() {
                 builder.stderr(process::Stdio::Handle(log_file.as_handle()));
-            }
-
-            if let Some(mut sandbox_profile) = config.sandbox_profile {
-                sandbox_profile.apply(&mut builder);
             }
 
             // Launch the child process on a separate thread to isolate
@@ -937,9 +927,27 @@ impl MeshInner {
                 command.stderr(process::Stdio::Fd(log_file.as_fd()));
             }
 
-            if let Some(mut sandbox_profile) = config.sandbox_profile {
-                sandbox_profile.apply(&mut command);
-                #[cfg(target_os = "linux")]
+            #[cfg(target_os = "linux")]
+            if let Some(profile) = &config.sandbox_profile {
+                let preparation = sandbox::prepare(profile, &sandbox::Identity::default(), &[])
+                    .context("failed to prepare sandboxed Mesh process")?;
+                command
+                    .set_clone_flags(
+                        preparation
+                            .clone_flags
+                            .try_into()
+                            .context("sandbox clone flags do not fit in i32")?,
+                    )
+                    .set_user_namespace_self_map(preparation.map_current_user);
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            if config.sandbox_profile.is_some() {
+                anyhow::bail!("sandboxed Mesh hosts are not supported on this Unix platform");
+            }
+
+            #[cfg(target_os = "linux")]
+            if config.restrict_inherited_fds {
                 command.set_inherited_fd_allowlist([0, 1, 2, IPC_FD]);
             }
 
@@ -1035,12 +1043,12 @@ mod tests {
     use std::os::fd::OwnedFd;
     use test_with_tracing::test;
 
+    #[test]
     #[cfg(target_os = "linux")]
-    struct NoopSandbox;
-
-    #[cfg(target_os = "linux")]
-    impl SandboxProfile for NoopSandbox {
-        fn apply(&mut self, _builder: &mut ProcessBuilder<'_>) {}
+    fn sandboxed_process_config_restricts_inherited_fds() {
+        let config = ProcessConfig::new_with_sandbox("test", sandbox::Profile::deny_all().build());
+        assert!(config.sandbox_profile.is_some());
+        assert!(config.restrict_inherited_fds);
     }
 
     #[async_test]
@@ -1094,7 +1102,8 @@ mod tests {
 
         let mesh = Mesh::new("fd-allowlist-test".to_string()).unwrap();
         mesh.launch_host(
-            ProcessConfig::new_with_sandbox("fd-allowlist-test", Box::new(NoopSandbox))
+            ProcessConfig::new("fd-allowlist-test")
+                .restrict_inherited_fds()
                 .process_name(std::env::current_exe().unwrap())
                 .skip_worker_arg(true)
                 .args([

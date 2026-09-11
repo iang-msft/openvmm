@@ -79,9 +79,9 @@ let preparation = sandbox::prepare(
 
 // Merge `preparation` into your own process builder: keep
 // `preparation.inherit_handles` inheritable, clone with
-// `preparation.clone_flags`, establish the user namespace's uid/gid maps,
-// set `preparation.uid` / `.gid`, and (on Windows) build the LPAC token
-// from `preparation.windows`. Then exec the child.
+// `preparation.clone_flags`, honor `preparation.map_current_user`, set
+// `preparation.uid` / `.gid`, and (on Windows) build the LPAC token from
+// `preparation.windows`. Then exec the child.
 ```
 
 Handle hygiene is the caller's job: there is no grant envelope and no
