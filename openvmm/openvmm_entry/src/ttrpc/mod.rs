@@ -21,6 +21,7 @@ struct FdRegistry {}
 
 use crate::cli_args::GuestPowerAction;
 use crate::meshworker::VmmMesh;
+use crate::sandbox_profiles::SandboxRole;
 use crate::serial_io::bind_serial;
 use crate::serial_io::connect_serial;
 use crate::vm_controller::GuestPowerActions;
@@ -1115,7 +1116,7 @@ impl VmService {
         // Create a VmmMesh for local/in-process workers.
         let mesh = VmmMesh::new(&self.driver, true)?;
         let vm_host = mesh
-            .make_host("vm", None)
+            .make_sandboxed_host(SandboxRole::Vm, None)
             .await
             .context("spawning vm process failed")?;
 

@@ -18,11 +18,9 @@
 //!
 //! There is no grant envelope and no in-crate FD sweep. [`SandboxProcessConfig`]
 //! reports exactly which tagged handles must remain inheritable in
-//! [`SandboxProcessConfig::inherit_handles`]; the caller is responsible for
-//! keeping those inheritable and closing or marking every other descriptor
-//! close-on-exec before the child is reached. Doing it caller-side means the
-//! one process that owns the descriptor table is the one that decides what
-//! leaves it.
+//! [`SandboxProcessConfig::inherit_handles`]; the caller's process builder is
+//! responsible for mapping those handles to their child descriptor numbers
+//! and closing every other descriptor in the pre-exec child context.
 
 use crate::Error;
 use crate::profile::Profile;
@@ -78,6 +76,9 @@ pub struct SandboxProcessConfig {
     /// worker starts inside its namespaces. The caller is also responsible for
     /// establishing the child user namespace's uid/gid mappings before exec.
     pub clone_flags: u64,
+    /// Map user and group ID 0 in the Linux user namespace to the spawning
+    /// process's effective user and group IDs.
+    pub map_current_user: bool,
     /// The tagged handles that must remain inheritable across the spawn. Every
     /// descriptor *not* listed here must be closed or marked close-on-exec by
     /// the caller before the child is reached.
@@ -148,6 +149,7 @@ pub fn prepare(
 ) -> Result<SandboxProcessConfig, Error> {
     let mut preparation = SandboxProcessConfig {
         clone_flags: 0,
+        map_current_user: false,
         inherit_handles: handles.to_vec(),
         uid: identity.uid,
         gid: identity.gid,
@@ -157,6 +159,7 @@ pub fn prepare(
     #[cfg(target_os = "linux")]
     if !crate::sandbox_disabled() {
         preparation.clone_flags = linux_clone_flags(profile);
+        preparation.map_current_user = true;
     }
 
     if cfg!(windows) {
@@ -168,12 +171,9 @@ pub fn prepare(
 
 #[cfg(target_os = "linux")]
 fn linux_clone_flags(profile: &Profile) -> u64 {
-    let mut flags = libc::CLONE_NEWUSER;
+    let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
     if profile.inner.network != crate::Network::Unrestricted {
         flags |= libc::CLONE_NEWNET;
-    }
-    if !profile.inner.fs.is_empty() {
-        flags |= libc::CLONE_NEWNS;
     }
     flags as u64
 }
@@ -224,10 +224,13 @@ mod tests {
         assert_eq!(prep.gid, Some(1000));
         assert_eq!(prep.inherit_handles, handles);
         #[cfg(target_os = "linux")]
-        assert_eq!(
-            prep.clone_flags,
-            (libc::CLONE_NEWUSER | libc::CLONE_NEWNET) as u64
-        );
+        {
+            assert_eq!(
+                prep.clone_flags,
+                (libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWNET) as u64
+            );
+            assert!(prep.map_current_user);
+        }
     }
 
     #[test]
@@ -241,7 +244,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn filesystem_grants_request_a_mount_namespace() {
+    fn filesystem_grants_preserve_default_namespaces() {
         let profile = Profile::deny_all().read("/usr/lib").build();
 
         assert_eq!(
@@ -257,7 +260,10 @@ mod tests {
             .network(crate::Network::Unrestricted)
             .build();
 
-        assert_eq!(linux_clone_flags(&profile), libc::CLONE_NEWUSER as u64);
+        assert_eq!(
+            linux_clone_flags(&profile),
+            (libc::CLONE_NEWUSER | libc::CLONE_NEWNS) as u64
+        );
     }
 
     #[cfg(target_os = "linux")]

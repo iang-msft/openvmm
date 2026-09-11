@@ -96,7 +96,7 @@ Carried forward from TSD §Non-goals, plus additions:
 | **`prepare`** | Control-process setup done before the child exists, via `sandbox::prepare()`. On Linux: handle hygiene, grant serialization, identity. On Windows: additionally the entire LPAC construction, since there is no post-launch equivalent. |
 | **`apply`** | The worker confining itself, as the first statement of `main()`, via `sandbox::apply()`. On Linux: the *entire* sandbox. On Windows: the post-launch half. |
 | **`tighten`** | Optional progressive tightening, run by the worker after its own initialization completes, via an additive-only `Restrictions` spec. Runs `sandbox::tighten()`. |
-| **Intent** | A platform-neutral capability statement — e.g. `Network::None`, `Syscalls::Allow(...)` — expressed through the widening builder ([§6.1](#61-type-vocabulary)) and translated by each backend into platform primitives. Public. |
+| **Intent** | A platform-neutral capability statement — e.g. `Network::None`, `Syscalls::Deny(...)` — expressed through the widening builder ([§6.1](#61-type-vocabulary)) and translated by each backend into platform primitives. Public. |
 
 ### 1.4 Existing process model: Mesh hosts, workers, and services
 
@@ -283,22 +283,22 @@ them.
 
 | # | Decision | Source |
 |---|---|---|
-| **D1** | **Two mandatory stages** — `prepare` (control process, before spawn) and `apply` (worker, first statement of `main()`) — plus optional `tighten`. On Linux the worker self-applies the entire sandbox in `apply`; on Windows `prepare` constructs the LPAC token and `apply` runs the post-launch half. | TSD Topic 1 + Topic 6 (as amended, [§3.2](#32-decisions-changed-since-the-tsd)) |
-| **D2** | **The Linux sandbox is self-applied in the worker's `main()`** — single-threaded, in a fresh address space — so there is no async-signal-safe fork/exec window and no launcher. `unshare(CLONE_NEWUSER)` is legal because the freshly-`execve`'d worker is single-threaded; the address space is clean, so the allocator, mutexes, and normal crates are all safe. | TSD Topic 1, Topic 6 (as amended, [§3.2](#32-decisions-changed-since-the-tsd)) |
+| **D1** | **Three mandatory Linux launch points** — `prepare` computes clone requirements in the control process, PAL creates namespaces and writes fixed ID maps in its clone callback, and `apply` performs rich confinement at the start of the worker — plus optional `tighten`. Windows keeps launch-time LPAC construction in `prepare`. | TSD Topic 1 + Topic 6 (as amended, [§3.2](#32-decisions-changed-since-the-tsd)) |
+| **D2** | **The Linux sandbox preserves PAL's vfork path.** Namespace flags are passed to `clone(2)`. The callback performs only fixed, precomputed `/proc/self/setgroups`, `uid_map`, and `gid_map` writes using libc; allocation, locking, tracing, and policy-rich setup remain post-`execve` in `apply`. | TSD Topic 1, Topic 6 (as amended, [§3.2](#32-decisions-changed-since-the-tsd)) |
 | **D3** | **`prepare` on Windows is LPAC construction** — AppContainer SID, capability SID list, `STARTUPINFOEX` attribute list, then `CreateProcess`. There is no `EnterAppContainer` API, so this must be control-side. | TSD Topic 1 Windows sub-section |
 | **D4** | **`apply` is the bulk of the sandbox** on Linux, and the post-launch half on Windows — run single-threaded in a fresh process where the allocator and normal crates are safe. | TSD Topic 6 |
 | **D5** | **Progressive tightening is `tighten`** and is optional and strictly monotonic — expressed as an additive-only `Restrictions` spec, so the ratchet holds by type ([§6.1](#61-type-vocabulary)). | TSD Topic 6 |
 | **D6** | **Public vocabulary is intent-level and platform-neutral.** No `landlock` / `seccompiler` / `caps` / `windows-sys` types cross the public API. | TSD Topic 9 |
 | **D7** | **Backends are `cfg`-gated modules inside one crate.** | TSD Topic 9 |
 | **D8** | **Broker-and-handles is mandatory.** Workers see resources only as inherited FDs / HANDLEs. Deferred: broker server and seccomp user-notify. | TSD Topic 5 |
-| **D9** | **Handle hygiene is mandatory.** `FD_CLOEXEC` / non-inheritable by default, explicit allowlist, `close_range` belt-and-suspenders on Linux, `HANDLE_LIST` on Windows. | TSD Topic 12 |
-| **D10** | **`mesh_process` stays generic.** The `SandboxProfile` trait and the `pal` sandbox setters are deleted. | TSD Topic 11 |
+| **D9** | **Handle hygiene is mandatory.** `FD_CLOEXEC` / non-inheritable by default, explicit allowlist, pre-`execve` `close_range` enforcement on Linux, `HANDLE_LIST` on Windows. | TSD Topic 12 |
+| **D10** | **`mesh_process` stays role-agnostic.** OpenVMM owns role selection and passes the resulting `Profile`; Mesh calls `sandbox::prepare` and applies its launch data to PAL. Mesh worker names are not security selectors. | TSD Topic 11 |
 | **D11** | **Mount namespace + bind mounts + `pivot_root` is the primary Linux FS isolation mechanism.** Landlock is a supplement, applied opportunistically with ABI-aware degradation. | TSD Topic 4 ("team preference, load-bearing") |
 | **D12** | **Empty network namespace is the primary Linux network restriction.** Landlock network needs ABI 4 / kernel 6.7, above both baselines. | TSD Topic 4 |
 | **D13** | **Seccomp is opt-in per worker class**, composed from library-contributed requirements plus explicit additions. `RET_KILL_PROCESS` in production. | TSD Topic 3, Topic 4, Topic 7 |
-| **D14** | **Failure policy is required-vs-opportunistic per primitive**, declared by the profile. Required failures abort; opportunistic failures log and degrade. | TSD Topic 7 |
-| **D15** | **UID/GID strategy is per-worker-class UID by default**, ephemeral per-spawn UID as a hardened option. | `uid_gid_sandboxing.md` |
-| **D16** | **Kernel/ABI features are queried at runtime and degraded**, never pinned or assumed. | TSD Topic 4, open question 5 |
+| **D14** | **Sandbox setup fails closed.** A requested namespace or required confinement primitive that cannot be applied aborts the worker launch; there is no retry with a weaker namespace set. | TSD Topic 7 |
+| **D15** | **Namespace UID/GID 0 map to the spawning process's effective UID/GID.** Distinct outer host identities are deferred until the control process has an explicit identity allocator. | `uid_gid_sandboxing.md` |
+| **D16** | **No PID namespace in the initial integration.** User, mount, and (unless networking is unrestricted) network namespaces are created at clone time. | TSD Topic 4, open question 5 |
 
 ### 3.2 Decisions changed since the TSD
 
@@ -309,8 +309,8 @@ who have read the TSD should read this table.**
 
 | # | Change | Was | Now | Rationale |
 |---|---|---|---|---|
-| **C1** | **Linux creation model** | TSD Topic 1: dedicated launcher binary (option 2b), `execve`d between control and worker. | **No launcher, and no forked-child `pre_exec` stage.** The worker self-applies its entire sandbox as the first statement of `main()`. | Eliminates a whole binary, a cross-binary wire format (TSD open q12), *and* the async-signal-safe fork/exec window that motivated the redesign (R-S10). `unshare(CLONE_NEWUSER)` needs a single-threaded caller — satisfied equally by the freshly-`execve`'d worker, which additionally has a clean address space (no inherited locked mutexes). So none of the async-signal-safety machinery is needed. **Consequence:** the pre-`main` window (dynamic loader + runtime init of our own, non-setuid binary) runs unconfined; accepted because it is trusted and runs no attacker-reachable code. See C2, C3. |
-| **C2** | **PID namespace** | TSD composition-order step 7 includes `CLONE_NEWPID`, which works because the launcher `execve`s a *child* into it. | **Omitted in v1.** Workers remain in the control process's PID namespace. | `unshare(CLONE_NEWPID)` moves only *future children* into the new namespace, and `execve` does not move the caller. Without a launcher there is no second process to place. R-S6 (no inter-process reach) is met instead by `PR_SET_DUMPABLE=0` + Yama + seccomp `ptrace`/`kill` denial + a distinct UID per worker class. Revisit if a launcher returns. |
+| **C1** | **Linux creation model** | TSD Topic 1: dedicated launcher binary (option 2b), `execve`d between control and worker. | **No launcher; PAL creates namespaces during its existing vfork-based clone.** The clone callback self-maps namespace IDs with fixed libc writes, then `execve`s. The worker performs all policy-rich setup in `apply`. | Preserves PAL's established process path while ensuring the program image starts inside its namespaces. The callback has a permanent async-signal-safe contract and carries only preformatted mapping bytes; all allocation-heavy and lock-taking work remains in the fresh post-`execve` image. |
+| **C2** | **PID namespace** | TSD composition-order step 7 includes `CLONE_NEWPID`. | **Omitted in v1.** Workers remain in the control process's PID namespace. | R-S6 (no inter-process reach) is met initially by `PR_SET_DUMPABLE=0`, Yama, and seccomp denial of cross-process operations. Distinct outer UIDs and a PID namespace remain possible later hardening steps. |
 | **C3** | **`/dev/kvm`, `/dev/mshv` access** | TSD Topic 4: Firecracker-style `mknod` + `chown` inside the new root, requiring `CAP_MKNOD` in the launcher. | **FD passing only.** The control process opens the device and passes the FD as a granted handle — over Mesh's `OsResource` sideband once the worker has attached, or on the pre-Mesh allowlist if it is needed earlier. | No `mknod`, no `CAP_MKNOD`, no device-node management inside the new root. FD passing is the TSD's own documented fallback, is simpler, satisfies R-O5, and reuses the resource-passing path Mesh already provides ([§10.4](#104-mesh-compatibility)). |
 | **C4** | **Windows scope** | TSD assumption: "Linux is first-class; Windows is forward-compatible." Windows backend explicitly **not** a v1 deliverable. | **Windows LPAC backend ships in v1 alongside Linux.** | Team decision. Resolves TSD open q1 by building the thing rather than reserving space for it. Sections 7 and 8 are deliberately symmetric. |
 | **C5** | **Policy vocabulary & ownership** | TSD Topics 2 / 8: composable `Capability` values on the wire; the earlier draft of this doc used a **closed `Profile` enum** in `support/sandbox` naming every worker class, with a compiled-in `ProfileSpec` catalog and a build-time hash over it. | **A default-deny base in `support/sandbox` that each worker builds on, with the concrete profile defined in the worker's own crate (or the `openvmm` crate).** `support/sandbox` exposes `Profile::deny_all()` and a widening-only builder; it does **not** enumerate worker classes. Policy is *linked, not sent* — `Profile` is not a wire type. | Decouples the sandbox crate from the set of workers: adding a worker no longer edits `support/sandbox`. The deny-all base guarantees R-S1 by construction. Composition is a compile-time concern in the owning crate, and because the Linux sandbox is self-applied (C1) the worker is the sole authority on its own policy — a compromised control process cannot compose or weaken it. **Trade-off:** the product no longer lists every sandbox in one file; recovered by an inventory CI test ([§12](#12-testing--ci-strategy)) rather than by a central enum. |
@@ -319,7 +319,7 @@ who have read the TSD should read this table.**
 | **C8** | **`PR_SET_DUMPABLE` placement** | TSD Topic 4 lists it among the launcher's (pre-`exec`) mandatory calls. | **In `apply`, specifically *after* the `setuid`/`setgid` drop.** | `execve` resets the dumpable flag to 1 for a normal (non-setuid) image, and changing the effective UID resets it again to `/proc/sys/fs/suid_dumpable`. It must therefore be the last credential-adjacent call. This is a latent bug in the TSD's launcher sequence too. |
 | **C9** | **`PR_SET_PDEATHSIG` placement** | TSD: launcher, once. | **In `apply`, *after* the credential drop.** | `PDEATHSIG` is cleared both by `execve` and by the `setuid` credential change, so it persists only if set after both — i.e. late in the worker's self-apply sequence. With the launcher gone there is no pre-`execve` window to cover, so the earlier "set it twice" workaround is unnecessary. |
 | **C10** | **Mandatory-always primitives** | TSD Topic 4 mandates locked securebits, `keyctl` session-keyring detach, `PR_SET_DUMPABLE=0`, `PR_SET_PDEATHSIG`, `setrlimit` defaults, `MS_NOSUID\|MS_NODEV` remounts, and io_uring restrictions. The architecture doc's stage tables omit **all of them**. | **All folded into the stage tables** in [§7.2](#72-primitive--stage--apply-point-matrix). | These are cheap, high-value, and were simply lost between documents. |
-| **C11** | **Failure policy** | Architecture doc: "Both `pre_exec` and `post_exec` fail hard by default." | **Required-vs-opportunistic per primitive**, declared by the profile (D14). | A blanket fail-hard contradicts TSD Topic 4's explicit instruction that OpenVMM-host *degrade* rather than refuse to launch where mount-NS setup is unavailable, and contradicts TSD Topic 7's recommendation. Fail-hard remains the default *classification* for most primitives; it is not a global policy. |
+| **C11** | **Failure policy** | TSD Topic 7 permits selected primitives to degrade. | **The initial OpenVMM integration fails hard for every requested namespace and required confinement primitive.** | Retrying without a requested boundary silently changes the security contract. Any future fallback must be an explicit operator-selected profile, not an automatic weaker retry. |
 | **C12** | **Non-Mesh spawn sites** | TSD open q10 required the architecture document to enumerate and decide per-site. The architecture doc does not mention them. | **Enumerated and marked explicitly unsandboxed in v1**, with tracking. See [§13.4](#134-non-mesh-spawn-sites). | Closes the open question with a documented, deliberate answer rather than an omission. |
 | **C13** | **Grant scope & delivery** | Earlier draft: a rich `Grant` (profile selector + hash + identity + full handle map) written to a dedicated inherited pipe on FD 3, with Mesh renumbered to FD 4. | **`Grant` is the pre-Mesh envelope only** — `wire_version` + identity + a minimal inherited-handle allowlist — delivered via the `SANDBOX_GRANT` environment variable, mirroring Mesh's own `MESH_WORKER_INVITATION`. Every working resource continues to ride Mesh's existing `OsResource` sideband, delivered *after* `apply`. | Maximum compatibility with `mesh_process` (`support/mesh/mesh_process/src/lib.rs`): no reserved grant FD, `IPC_FD = 3` is not renumbered, and the sandbox does not re-implement resource passing that Mesh already does. See [§10.4](#104-mesh-compatibility). |
 | **C14** | **Policy hash** | Earlier draft: `build.rs` computes `SANDBOX_PROFILE_HASH` over the profile catalog; the worker rejects a grant whose hash differs. | **Dropped.** Only `wire_version` gates the envelope. | Under self-apply (C1) the worker is the sole authority on its own Linux policy — there is no second copy on the other side of the boundary to desynchronize, so a policy hash verifies bytes only one process holds. A narrow contract check is reintroduced *only* if parent and worker ever ship as independently-built binaries; even then it should cover the handle-tag vocabulary and the Windows launch-time half, not the self-applied policy body. |
@@ -402,14 +402,13 @@ no `EnterAppContainer` API (D3). `apply` is everything the *worker*
 does to itself once its image is live, as ordinary single-threaded
 Rust.
 
-**There is no forked-child stage.** The redesign's original complaint
-(R-S10) was that the sandbox called allocating code between `fork` and
-`execve`. The fix here is structural: nothing runs in that window at
-all. On Linux the worker self-applies in `main()`, which is
-single-threaded — so `unshare(CLONE_NEWUSER)` is legal — *and* has a
-clean address space — so the allocator, mutexes, `tracing`, and normal
-crates are all safe. The async-signal-safety constraint, the launcher,
-and all of their machinery simply cease to exist.
+**The forked-child stage is deliberately tiny.** PAL already launches
+through `clone(CLONE_VM | CLONE_VFORK)`. Namespace flags are added to
+that call, and the callback writes preformatted self-maps to
+`/proc/self/{setgroups,uid_map,gid_map}` with libc before `execve`.
+It performs no allocation, locking, tracing, policy construction, or
+filesystem assembly. The worker then runs `apply` in its fresh,
+single-threaded image, where normal Rust and policy libraries are safe.
 
 **Windows `apply` is smaller than Linux `apply`.** On Windows the
 security-critical work is front-loaded into `prepare` (LPAC is in
@@ -446,13 +445,13 @@ not both at once.
 ```mermaid
 graph TB
     subgraph CTRL["STAGE 1 · prepare — control process (trusted · full ambient authority)"]
-        PL["<b>Linux</b> — thin<br/>mark allowlisted FDs inheritable · CLOEXEC the rest<br/>serialize Grant → SANDBOX_GRANT env · carry identity"]
+        PL["<b>Linux</b> — thin<br/>construct fixed child-FD allowlist<br/>serialize Grant → SANDBOX_GRANT env · carry identity"]
         PW["<b>Windows</b> — heavy (LPAC built here)<br/>AppContainer SID · capability SIDs<br/>STARTUPINFOEX: LPAC opt-out · HANDLE_LIST · mitigations<br/>serialize Grant → SANDBOX_GRANT env"]
     end
 
     subgraph CHILD["Child process — trusted bootstrap until confinement; untrusted role code afterward"]
         AP["<b>apply()</b> · FIRST STATEMENT of main()<br/>trusted-computing-base phase until declared confinement is complete"]
-        APL["<b>Linux</b> — the entire sandbox<br/>unshare(user/mnt/net/ipc/uts/cgroup)<br/>uid_map/gid_map · bind mounts · pivot_root<br/>close_range · caps=∅ + locked securebits<br/>setgid/setuid · NO_NEW_PRIVS<br/>Landlock · seccomp (init ∪ steady-state)"]
+        APL["<b>Linux</b> — pre-exec PAL callback maps allowed FDs<br/>and closes all others; apply then establishes<br/>namespaces · bind mounts · pivot_root<br/>caps=∅ + locked securebits · setgid/setuid<br/>NO_NEW_PRIVS · Landlock · seccomp"]
         APW["<b>Windows</b> — post-launch half only<br/>Job Object · post-launch mitigations<br/>privilege strip · deny-only groups · integrity level"]
         SETUP["SANDBOX BOUNDARY IS NOW ACTIVE<br/>&lt;worker process setup&gt;<br/>attach Mesh · receive granted FDs + OsResources<br/>map guest memory · spawn worker threads"]
         TI["<b>tighten()</b> · optional · after setup"]
@@ -627,7 +626,7 @@ graph TB
     end
 
     subgraph LinuxBackend["cfg(target_os = &quot;linux&quot;)"]
-        LP["<b>apply</b> — worker main()<br/>unshare · uid_map · mounts · pivot_root<br/>close_range · caps + securebits<br/>setgid/setuid · DUMPABLE · PDEATHSIG<br/>NO_NEW_PRIVS · Landlock · seccomp"]
+        LP["<b>PAL clone callback</b> — map allowed FDs · close_range<br/><b>apply</b> — worker main()<br/>unshare · uid_map · mounts · pivot_root<br/>caps + securebits · setgid/setuid<br/>DUMPABLE · PDEATHSIG · NO_NEW_PRIVS<br/>Landlock · seccomp"]
     end
 
     subgraph WindowsBackend["cfg(target_os = &quot;windows&quot;)"]
@@ -714,7 +713,10 @@ impl Builder {
 /// `landlock::`, `seccompiler::`, `caps::`, or `windows_sys::` type
 /// ever crosses this surface (R-S11).
 pub enum Network { None, Loopback, Unrestricted }
-pub enum Syscalls { Unfiltered, Allow(&'static [&'static str]) }
+pub enum Syscalls {
+    Unfiltered,
+    Deny(&'static [&'static str]),
+}
 /// An opaque, named platform capability, constructed from
 /// crate-provided constants (`Capability::LPAC_COM`, …). The consumer
 /// never sees the underlying SID or grant.
@@ -722,9 +724,9 @@ pub struct Capability(/* opaque */);
 
 /// A narrow, additive-only ratchet for `tighten` — deliberately *not*
 /// a `Profile`. It can express only the primitives that are safe to
-/// stack onto an already-applied sandbox: a strictly smaller syscall
-/// allowlist and a further-restricted Landlock ruleset (Linux → an
-/// additional seccomp filter / tighter Landlock). The one-shot,
+/// stack onto an already-applied sandbox: additional syscall denials
+/// and a further-restricted Landlock ruleset (Linux → an additional
+/// seccomp filter / tighter Landlock). The one-shot,
 /// authority-consuming
 /// primitives — namespaces, credentials, mounts / `pivot_root`,
 /// capability grants — are simply absent from this type, so a
@@ -744,11 +746,10 @@ impl Restrictions {
 pub struct RestrictionsBuilder { /* opaque */ }
 
 impl RestrictionsBuilder {
-    /// Replace the active syscall surface with a strictly smaller
-    /// allowlist, installed as an additional stacked seccomp filter —
-    /// the kernel takes the most restrictive verdict across every
-    /// installed filter.
-    pub fn syscalls(self, allow: &'static [&'static str]) -> Self;
+    /// Deny additional syscalls with a stacked seccomp filter — the
+    /// kernel takes the most restrictive verdict across every installed
+    /// filter.
+    pub fn syscalls(self, deny: &'static [&'static str]) -> Self;
     /// Enforce an additional Landlock ruleset that *removes* access to
     /// a path already permitted by the applied profile; it can never
     /// add access.
@@ -854,11 +855,10 @@ pub fn prepare(
 /// half (Job Object, mitigation policies, token strip). Returns the
 /// pre-Mesh `Handles`.
 ///
-/// The seccomp allowlist installed here is the profile's *complete*
-/// filter. Because seccomp is monotonic and `apply` runs first, that
-/// allowlist is necessarily the union of the worker's init-time and
-/// steady-state syscalls; shedding the init-only surface afterward is
-/// the job of the optional `tighten` (R-F5).
+/// A profile may install the dangerous-syscall deny baseline plus
+/// worker-specific additional denials. The denylist is default-allow so it
+/// does not require enumerating the worker's complete initialization and
+/// steady-state syscall surface.
 ///
 /// No-op returning `Handles::empty()` when no grant is present — the
 /// single-process / dev path, mirroring how `try_run_mesh_host`
@@ -872,11 +872,10 @@ pub fn apply(profile: &Profile) -> Result<Handles, Error>;
 
 /// STAGE 3 (optional) — worker, after its own initialization.
 ///
-/// `apply` already installed the worker's entire linked profile,
-/// including the full (init + steady-state) seccomp allowlist. This is
-/// the optional ratchet that sheds the init-only surface once the
-/// worker has finished starting up — received its Mesh resources,
-/// mapped memory, spawned its threads.
+/// `apply` already installed the worker's linked denylist profile. This is
+/// the optional ratchet that adds further syscall denials once the worker has
+/// finished starting up — received its Mesh resources, mapped memory, spawned
+/// its threads.
 ///
 /// It takes `Restrictions` — a narrow, additive-only spec — rather
 /// than a `Profile`, so a non-monotonic ratchet cannot even be written
@@ -1095,7 +1094,7 @@ alternative so it does not get relitigated.
 | **User NS (`CLONE_NEWUSER`)** | **Unprivileged bootstrap** for the other `CLONE_NEW*` calls, and the substrate for the UID remap. | 3.8+ | Not a boundary in its own right in our model. Where the control process already has `CAP_SYS_ADMIN` (OpenHCL), it is still used, because it is what makes the uid_map remap possible. Blocked on some distros — see [§7.6](#76-deployment-surface--degradation-matrix). |
 | **Linux capabilities + securebits** | **Configuration hygiene** (R-S4). Drop all five sets to empty, then lock securebits so they cannot be re-acquired. | Universal | `SECBIT_NOROOT_LOCKED \| SECBIT_NO_SETUID_FIXUP_LOCKED \| SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED`. Without the locked securebits, a UID-0 worker regains caps across `execve`. |
 | **`PR_SET_NO_NEW_PRIVS`** | Prerequisite for unprivileged seccomp and Landlock. | 3.5+ | Set in **`apply`**, right before the filters it enables. Survives `execve` and cannot be cleared. |
-| **seccomp-bpf** | **Syscall surface reduction** (R-S8), **opt-in per worker class** (D13, R-S13). | Universal | Opt-in because the syscall list encodes link-set details — mesh, glibc, allocator, toolchain — that drift (TSD Topic 3). `RET_KILL_PROCESS` in production, `RET_LOG` in dev. Filters stack, which is what makes `tighten` monotonic. Blind to io_uring SQE opcodes — see below. |
+| **seccomp-bpf** | **Dangerous syscall denial** (R-S8), **opt-in per worker class** (D13, R-S13). | Universal | V1 uses a default-allow denylist to avoid maintaining each worker's complete link-set-dependent syscall inventory. The mandatory baseline blocks namespace escapes and historically risky kernel surfaces; profiles may add further denials. `RET_KILL_PROCESS` in production and `EPERM` in debug builds. Filters stack, which makes `tighten` monotonic. Blind to io_uring SQE opcodes — see below. |
 | **Landlock** | **Supplementary FS restriction** (D11), applied opportunistically with ABI-aware degradation (D16). | 5.13+ | Explicitly *not* the primary FS mechanism. On the OpenVMM-host baseline it is ABI 1 only: no `FS_REFER`, no `FS_TRUNCATE`, so it cannot fully restrict cross-directory rename or `O_TRUNC`. Applied *before* seccomp (C7) so the final filter can deny the Landlock syscalls. |
 | **IPC / UTS / cgroup NS** | Cheap defense-in-depth name hiding. Default-on wherever mount NS is on. | Universal | Not boundaries on their own. |
 | **PID NS** | **Omitted in v1** (C2). | — | `unshare(CLONE_NEWPID)` moves only future children; `execve` does not move the caller. R-S6 is met by other means — see the supporting controls below. |
@@ -1108,7 +1107,7 @@ alternative so it does not get relitigated.
 | `MS_REC \| MS_PRIVATE` on `/` before `pivot_root` | Hard prerequisite of `pivot_root`; also stops mount events propagating back out | `apply` |
 | `/proc` with `hidepid=2,subset=pid` | Hides other processes' `/proc` entries — a component of R-S6 | `apply` |
 | `/sys` read-only, or omitted entirely | Reduces attack surface | `apply` |
-| `close_range(max_allowlisted + 1, u32::MAX, 0)` | Belt-and-suspenders for R-S7 | `apply` |
+| `close_range` outside the fixed child-FD allowlist | Prevents any unexpected descriptor from crossing `execve` (R-S7) | `clone` |
 | `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)` | Detaches the inherited session keyring (Kerberos tickets, MSI tokens, NFS auth). **Opportunistic** — blocked by Docker's default seccomp, which is acceptable since container keyrings are typically empty | `apply` |
 | `prctl(PR_SET_DUMPABLE, 0)` | Blocks same-UID `ptrace` at Yama level 0 and locks `/proc/PID/` ownership to root. Component of R-S6. **Must run after the credential drop** (C8) | `apply` |
 | `prctl(PR_SET_PDEATHSIG, SIGKILL)` | Worker dies with its control process. **Set in `apply`, after the credential drop clears it** (C9) | `apply` |
@@ -1125,27 +1124,25 @@ abstractions (no mainline Linux equivalent; rejected upstream).
 ### 7.2 Primitive × stage × apply-point matrix
 
 Legend — stages are as defined in [§5.1](#51-the-three-stages): `prepare` =
-control process, before the spawn; `apply` = worker `main()`, first
-statement, single-threaded and freshly execve'd; `tighten` = after
-worker init. **R** = required by default, **O** = opportunistic by
-default (D14; each profile may override). There is no forked-child
-stage — the whole Linux sandbox is one linear sequence in `apply`.
+control process, before the spawn; `clone` = PAL's minimal vfork-safe
+callback; `apply` = worker startup, single-threaded and freshly execve'd;
+`tighten` = after worker init. **R** = required and fails closed.
 
 | Primitive | Stage | Class | Ordering constraint |
 |---|---|---|---|
-| Mark non-allowlisted FDs `FD_CLOEXEC` | `prepare` | R | Before spawn |
+| Create source FDs with `O_CLOEXEC` or an equivalent atomic flag | normal operation | R | At FD creation; defense in depth against every spawn path |
+| Compute the fixed child-FD allowlist | `prepare` | R | Before spawn |
 | Serialize `Grant` into `SANDBOX_GRANT` env | `prepare` | R | Before spawn |
 | Read + verify `Grant` | `apply` | R | **First**, before anything else |
 | `setrlimit` bundle | `apply` | R | Early; before the credential drop |
-| `unshare(CLONE_NEWUSER)` | `apply` | R | **First unshare.** Grants `CAP_SYS_ADMIN` in the new ns, which the rest need |
-| write `/proc/self/setgroups` = `deny` | `apply` | R | After `CLONE_NEWUSER`, **before** `gid_map` |
-| write `/proc/self/uid_map`, `gid_map` | `apply` | R | After `CLONE_NEWUSER`, before `DUMPABLE=0` (which would reroot these files) |
-| `unshare(CLONE_NEWNS\|NEWNET\|NEWIPC\|NEWUTS\|NEWCGROUP)` | `apply` | R (NEWNS, NEWNET) / O (rest) | After the user ns exists |
+| `clone(CLONE_NEWUSER\|CLONE_NEWNS[\|CLONE_NEWNET])` | `clone` | R | Namespace set is fixed by the linked profile; no weaker retry |
+| write `/proc/self/setgroups` = `deny` | `clone` | R | libc-only callback, before `gid_map` |
+| write `/proc/self/uid_map`, `gid_map` | `clone` | R | Preformatted `0 <effective-id> 1` mappings, before `execve` |
 | `mount(NULL, "/", NULL, MS_REC\|MS_PRIVATE, NULL)` | `apply` | R | Before any bind mount |
 | Bind mounts + `MS_BIND\|MS_REMOUNT` flag fixups | `apply` | R | Remount is required: the original `MS_BIND` does not carry `NOSUID`/`NODEV`/`NOEXEC` |
 | Mount `/proc` (`hidepid=2,subset=pid`), `/sys` ro | `apply` | O | Within the new root |
 | `pivot_root` + `umount2(".", MNT_DETACH)` + `chdir("/")` | `apply` | R | After the new root is fully populated |
-| `close_range` above the allowlist | `apply` | R | After the grant is read; before seccomp could deny it |
+| Map allowlisted FDs, then `close_range` every other FD | `clone` | R | In PAL's private child FD table, after pre-exec FD consumers and before `execve` |
 | `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)` | `apply` | O | — |
 | Clear ambient caps → `capset` zero → `PR_CAPBSET_DROP` all | `apply` | R | **After** mounts, which may need `CAP_SYS_ADMIN` |
 | `prctl(PR_SET_SECUREBITS, ...LOCKED)` | `apply` | R | Immediately after the capability drop |
@@ -1199,6 +1196,7 @@ sequenceDiagram
     autonumber
     participant CP as Control Process<br/>(multi-threaded)
     participant K as Linux kernel
+    participant C as Child<br/>(pre-exec PAL callback)
     participant W as Worker<br/>(post-execve, single-threaded main)
 
     rect rgb(232, 244, 253)
@@ -1206,13 +1204,15 @@ sequenceDiagram
         CP->>CP: grant = Grant { wire_version, identity, handles }
         CP->>CP: sandbox::prepare(&mut builder, profile, identity, handles)
         CP->>CP: encode grant → SANDBOX_GRANT env on builder
-        CP->>CP: FD_CLOEXEC on every non-allowlisted FD
-        CP->>K: builder.spawn()
+        CP->>C: clone(NEWUSER|NEWNS[|NEWNET], CLONE_VM|CLONE_VFORK)
+        C->>K: write setgroups, uid_map, gid_map
+        C->>C: map allowlisted FDs to fixed targets
+        C->>K: close_range(all non-allowlisted FDs)
     end
 
     rect rgb(240, 255, 244)
-        Note over K,W: B — execve
-        K->>W: execve(worker, argv, envp)<br/>SANDBOX_GRANT in env; mesh fd (IPC_FD=3) inherited
+        Note over C,W: B — execve
+        C->>W: execve(worker, argv, envp)<br/>SANDBOX_GRANT in env; mesh fd (IPC_FD=3) inherited
         Note right of W: main() — single-threaded, fresh heap.<br/>Normal Rust from here: no fork, no ASYNC-SIGNAL zone.
     end
 
@@ -1220,15 +1220,10 @@ sequenceDiagram
         Note over W,K: C — apply, in order (worker main())
         W->>W: read SANDBOX_GRANT; decode; verify wire_version
         W->>K: setrlimit bundle
-        W->>K: unshare(CLONE_NEWUSER)
-        W->>K: write /proc/self/setgroups = "deny"
-        W->>K: write /proc/self/uid_map, /proc/self/gid_map
-        W->>K: unshare(NEWNS|NEWNET|NEWIPC|NEWUTS|NEWCGROUP)
         W->>K: mount(/, MS_REC|MS_PRIVATE)
         W->>K: bind mounts + MS_REMOUNT with NOSUID|NODEV|NOEXEC|RDONLY
         W->>K: mount /proc (hidepid=2,subset=pid); /sys ro
         W->>K: pivot_root; umount2(".", MNT_DETACH); chdir("/")
-        W->>K: close_range(above allowlist)
         W->>K: keyctl(JOIN_SESSION_KEYRING, NULL)
         W->>K: clear ambient; capset zero; PR_CAPBSET_DROP all
         W->>K: prctl(PR_SET_SECUREBITS, ...LOCKED)
@@ -1255,20 +1250,18 @@ sequenceDiagram
 
 ### 7.5 Why self-apply is safe
 
-The redesign's motivating complaint (R-S10) was that the current
-implementation calls `landlock::restrict_self` and
-`seccompiler::apply_filter` from inside a `clone(2)` callback — a child
-that shares the parent's address space, where any allocation, mutex, or
-`tracing` call risks deadlock or corruption. Self-apply removes that
-hazard at the root rather than fencing it off.
+The redesign's motivating complaint (R-S10) was policy-rich work inside
+a `clone(2)` callback sharing the parent's address space, where any
+allocation, mutex, or tracing call risks deadlock or corruption. The
+remaining callback is constrained to fixed libc writes for ID mapping;
+Landlock, seccomp, mounts, capabilities, and tracing stay post-`execve`.
 
 Two properties make `apply` safe to write in ordinary Rust:
 
 1. **Single-threaded.** A freshly `execve`'d process enters `main()`
    with exactly one thread. The sandbox self-applies before it starts
-   any async runtime or spawns any thread, so `unshare(CLONE_NEWUSER)`
-   — which the kernel rejects for a multi-threaded caller — is legal,
-   and no other thread can observe the half-built sandbox.
+  any async runtime or spawns any thread, so no other thread can
+  observe the half-built post-exec sandbox.
 
 2. **Clean address space.** `execve` replaced the image: the heap, the
    allocator, every mutex, and the `tracing` subsystem are freshly
@@ -1276,13 +1269,10 @@ Two properties make `apply` safe to write in ordinary Rust:
    mid-update lock, so `malloc`, `String`, `tracing`, and the
    `landlock` / `seccompiler` / `caps` crates are all safe to call.
 
-Consequently **there is no async-signal-safety contract** — and none of
-the machinery that used to enforce it. The `pre_exec.rs` module
-isolation, the `clippy.toml` `disallowed-methods` wall, the `deny.toml`
-static-initializer ban, the stack-only `PreExecOps` struct, and the
-`strace`-based fork-window syscall allowlist are all **deleted along
-with the forked-child stage**. This is the central simplification the
-redesign buys.
+The clone callback therefore retains an async-signal-safety contract,
+but its surface is intentionally fixed and small: stack-only mapping
+data and `open`/`write`/`close`/`execve`-path libc operations. Normal
+policy evolution occurs in `apply` and cannot enlarge that callback.
 
 **The one discipline that remains.** `apply` must run before the worker
 starts its first thread. That is a single, auditable ordering property
@@ -1306,10 +1296,10 @@ Closes TSD open question 4. Three supported surfaces (R-P5):
 | | **S1 — Bare host** | **S2 — Docker, default seccomp** | **S3 — k8s `restricted` PodSecurity** |
 |---|---|---|---|
 | **Who** | OpenHCL VTL2; OpenVMM-host on a dedicated machine | OpenVMM-host in a container | OpenVMM-host in a hardened cluster |
-| `unshare(CLONE_NEWUSER)` | ✅ | ✅ (Docker's default profile exempts it) | ✅ |
-| `unshare(CLONE_NEWNS)` | ✅ | ✅ *only via* `CLONE_NEWUSER` first | ✅ via user NS |
+| `clone(CLONE_NEWUSER)` | ✅ | Deployment profile must permit it | Deployment profile must permit it |
+| `clone(CLONE_NEWNS)` | ✅ | ✅ with the new user namespace | ✅ with the new user namespace |
 | `mount`, `pivot_root` | ✅ | ✅ inside the user NS | ✅ inside the user NS |
-| `unshare(CLONE_NEWNET)` | ✅ | ✅ via user NS | ✅ via user NS |
+| `clone(CLONE_NEWNET)` | ✅ | ✅ with the new user namespace | ✅ with the new user namespace |
 | Capability drop | ✅ | ✅ | ✅ (already forced to drop) |
 | seccomp | ✅ | ✅ (stacks under Docker's profile) | ✅ — but note `restricted` forbids `Unconfined`, so our filter must be *additive* |
 | Landlock | ✅ | ✅ | ✅ |
@@ -1324,16 +1314,13 @@ older distros disable it via `user.max_user_namespaces=0` or
 cannot create the user namespace, and therefore cannot create the
 mount or network namespace either.
 
-**Degraded mode.** Per D14 and C11, the OpenVMM-host profile classifies
-namespace setup as **opportunistic**, so on such a system the worker
-still launches with: capability drop and locked securebits,
-`NO_NEW_PRIVS`, `close_range` and FD allowlisting, `PR_SET_DUMPABLE=0`,
-Landlock as the FS boundary (ABI 1 — degraded, no `REFER` or `TRUNCATE`),
-and seccomp if the profile opts in. It loses mount-NS FS isolation and
-netns network isolation. The control process emits a structured
-`sandbox.degraded` event naming each primitive that was skipped (R-O2).
-The operator escape is an AppArmor profile addition or
-`sysctl kernel.unprivileged_userns_clone=1`, documented in `Guide/`.
+**Failure behavior.** Per D14 and C11, namespace setup is required. On
+such a system the worker does not launch, and the control process
+reports the failed sandbox primitive. There is no automatic retry
+without mount or network isolation. The operator must enable the
+required user-namespace policy, for example with an AppArmor profile
+addition or `sysctl kernel.unprivileged_userns_clone=1`, or explicitly
+select a future weaker profile if one is designed and reviewed.
 
 The **OpenHCL profile classifies all of these as required**, because
 OpenHCL controls its own kernel and there is no legitimate reason for
@@ -1620,20 +1607,20 @@ takes an additive-only `Restrictions` ([§6.1](#61-type-vocabulary)), not
 a profile (R-F5).
 
 **Stage** columns use the values from [§5.1](#51-the-three-stages): on Linux
-almost everything is `apply` (the worker self-applies the whole
-sandbox); on Windows launch-only work is `prepare` and the rest is
+namespace creation and ID mapping are `clone`, while policy-rich work
+is `apply`; on Windows launch-only work is `prepare` and the rest is
 `apply`. Cells reflect the C7–C10 corrections, so this table supersedes
 the equivalent table in `Sandbox_architecture.md`.
 
 | Policy dimension | Linux backend | Linux stage | Windows LPAC backend | Win stage |
 |---|---|---|---|---|
-| `NamespaceIsolation` | `unshare(CLONE_NEWUSER\|NEWNS\|NEWNET\|NEWIPC\|NEWUTS\|NEWCGROUP)`. **No `CLONE_NEWPID`** (C2) | **`apply`** | Inherent to AppContainer | `prepare` (inherent) |
+| `NamespaceIsolation` | `clone(CLONE_NEWUSER\|CLONE_NEWNS[\|CLONE_NEWNET])`, then self-map UID/GID 0. **No `CLONE_NEWPID`** (C2) | **`clone`** | Inherent to AppContainer | `prepare` (inherent) |
 | `Filesystem::Rootfs(binds)` | `MS_REC\|MS_PRIVATE` → bind mounts → `MS_REMOUNT` flag fixups → `pivot_root` → `umount2(MNT_DETACH)` | **`apply`** | LPAC opt-out makes the FS default-deny; per-container FS area | `prepare` (inherent) |
 | `Filesystem::LandlockSupplement` | ABI probe → ruleset → `landlock_restrict_self`. **Before seccomp** (C7) | **`apply`** | N/A | — |
-| `NetworkAccess::None` | Empty netns + optional seccomp `EAFNOSUPPORT` on `socket()` | **`apply`** | **Omit** `internetClient`, `internetClientServer`, `privateNetworkClientServer` capability SIDs | **`prepare`** |
-| `NetworkAccess::LoopbackOnly` | Netns + bring `lo` up + seccomp allowlist for loopback binds | **`apply`** | No network capability SIDs; Job Object network rate control | `prepare` + `apply` |
+| `NetworkAccess::None` | Empty netns + optional seccomp `EAFNOSUPPORT` on `socket()` | `clone` + **`apply`** | **Omit** `internetClient`, `internetClientServer`, `privateNetworkClientServer` capability SIDs | **`prepare`** |
+| `NetworkAccess::LoopbackOnly` | Netns + bring `lo` up | `clone` + **`apply`** | No network capability SIDs; Job Object network rate control | `prepare` + `apply` |
 | `NetworkAccess::Unrestricted` | Preserve the caller's network namespace | **`prepare`** | Not yet implemented | — |
-| `Handles::AllowlistOnly` | Parent `FD_CLOEXEC` sweep (`prepare`) + `close_range(max+1, MAX, 0)` (`apply`) | `prepare` + **`apply`** | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (mandatory) + parent `HANDLE_FLAG_INHERIT` sweep | **`prepare`** |
+| `Handles::AllowlistOnly` | Atomic `O_CLOEXEC` at creation + fixed target mapping and `close_range` in PAL's pre-exec child callback | `prepare` + **`clone`** | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (mandatory) + parent `HANDLE_FLAG_INHERIT` sweep | **`prepare`** |
 | `Privileges::DropAll` | clear ambient → `capset` zero → `PR_CAPBSET_DROP` all → locked securebits | **`apply`** | `AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)` | **`apply`** |
 | `Credentials::Uid(uid)/Gid(gid)` | uid_map/gid_map then `setgroups([])`→`setgid`→`setuid` | **`apply`** | AppContainer SID *is* the identity; `AdjustTokenGroups(SE_GROUP_USE_FOR_DENY_ONLY)` for residual groups | `prepare` + `apply` |
 | `NoNewPrivs` | `prctl(PR_SET_NO_NEW_PRIVS, 1)` — before the filters it enables | **`apply`** | Analogous LPAC token behavior | `prepare` (inherent) |
@@ -1698,24 +1685,25 @@ purpose is resolved by the message field, not by a handle tag.
 
 ### 10.2 Handle hygiene
 
-R-S7 is enforced on both sides of the spawn, on both platforms:
+R-S7 is enforced as part of process creation on both platforms:
 
-**Parent side, before the spawn (`prepare`):**
-
-| Linux | Windows |
-|---|---|
-| Set `FD_CLOEXEC` on every FD not in the allowlist | Clear `HANDLE_FLAG_INHERIT` on every handle not in the allowlist |
-| Assign allowlisted FDs to fixed, low numbers | Populate `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` |
-
-**Child side, in `apply`:**
+**Before cloning (`prepare` and normal FD creation):**
 
 | Linux | Windows |
 |---|---|
-| `close_range(max_allowlisted + 1, u32::MAX, 0)` | `ProcessStrictHandleCheckPolicy` (turns a bad-handle use into an immediate fault) |
+| Create source FDs with `O_CLOEXEC` or an equivalent atomic flag; compute fixed child targets | Clear `HANDLE_FLAG_INHERIT` on every handle not in the allowlist |
+| Pass the allowlist to the process builder | Populate `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` |
 
-The parent sweep is the primary mechanism; the child sweep catches
-anything the parent missed — most plausibly an FD opened by a
-library's background thread between the sweep and the spawn.
+**Child side, before executing the worker:**
+
+| Linux | Windows |
+|---|---|
+| PAL maps allowed FDs to fixed targets and uses `close_range` for every other descriptor | `ProcessStrictHandleCheckPolicy` (turns a bad-handle use into an immediate fault) |
+
+The Linux pre-exec close is the primary enforcement mechanism. It runs in the
+child's private FD table, so descriptors opened concurrently by another parent
+thread after `clone` cannot appear, and closure cannot affect the parent.
+Atomic CLOEXEC-at-creation remains defense in depth for all other spawn paths.
 
 **FD numbering — unchanged.** Mesh already fixes `IPC_FD = 3`
 (`support/mesh/mesh_process/src/lib.rs`) and the sandbox deliberately
@@ -1793,21 +1781,18 @@ the development inner loop (R-F8).
 
 ### 11.1 Required vs opportunistic
 
-Per D14/C11, each primitive in a `Profile` is tagged **required**
-or **opportunistic**. This is the mechanism that makes one design
-serve both OpenHCL (a controlled kernel, where everything should
-work) and OpenVMM-host (arbitrary distros, containers, and CI, where
-some things will not).
+Per D14/C11, requested namespace and primary confinement primitives are
+**required**. Explicitly supplementary mechanisms may be
+**opportunistic** when a primary boundary remains in force; Landlock is
+the current example because the mount namespace remains authoritative.
 
 | Class | On failure | Emits |
 |---|---|---|
 | **Required** | Worker exits immediately with `EXIT_SANDBOX_FAILED`; the control process reports the spawn as failed | `sandbox.failed` (error) |
 | **Opportunistic** | Log and continue | `sandbox.degraded` (warn) |
 
-The tagging is **per profile**, not global — the same primitive can
-be required in the OpenHCL profile and opportunistic in the
-OpenVMM-host profile. `unshare(CLONE_NEWUSER)` is exactly this case
-(see [§7.6](#76-deployment-surface--degradation-matrix)).
+Namespace creation is never opportunistic in the initial OpenVMM
+integration (see [§7.6](#76-deployment-surface--degradation-matrix)).
 
 **No silent fallback.** An opportunistic failure is still an event
 with a named primitive and an errno; it is never swallowed. A profile
@@ -1833,7 +1818,7 @@ in order of preference:
 
 The control process correlates all three and emits one event per
 spawn, so the operator sees "device worker for VM X failed to
-sandbox: `unshare(CLONE_NEWUSER)` returned `EPERM`" rather than an
+sandbox: `clone(CLONE_NEWUSER)` returned `EPERM`" rather than an
 opaque nonzero exit.
 
 ### 11.3 Structured event fields
@@ -1848,19 +1833,16 @@ Both `sandbox.degraded` and `sandbox.failed` carry:
 | `errno` / `hresult` | The raw platform error |
 | `class` | `required` or `opportunistic` |
 
-Seccomp denials in `RET_LOG` mode additionally carry `denied_syscall`
-and `arg0`..`arg5`, which is what makes profile development
-tractable: run the worker in dev mode, collect the denial log,
-and widen the filter from evidence rather than from guesswork.
+Seccomp application failures carry the primitive and platform error. V1
+denylist maintenance is review-driven rather than learned from runtime traces:
+new denials require a security rationale and focused enforcement coverage.
 
 ### 11.4 Audit posture
 
-- **Production:** seccomp `RET_KILL_PROCESS`. A denial is a crash,
-  and a crash is a bug — either in the profile or in the worker.
-  There is no "log and allow" in production, because that is
-  indistinguishable from having no filter.
-- **Development:** seccomp `RET_LOG`. Denials are recorded and
-  execution continues.
+- **Production:** seccomp `RET_KILL_PROCESS`. Reaching a denied syscall
+  terminates the worker.
+- **Development:** denied syscalls return `EPERM`, allowing focused tests
+  and local diagnosis without weakening the filter.
 - **Selecting between them** is a build/deploy property, not a
   runtime flag a compromised process could flip (R-O4).
 
@@ -1936,42 +1918,44 @@ such tests is visible and can be driven to zero.
 
 ### 12.3 Profile-development workflow
 
-Deriving a seccomp filter by inspection does not work. The supported
-loop is:
+V1 deliberately uses a default-allow denylist instead of attempting to derive
+complete per-worker syscall inventories. Update the policy as follows:
 
-1. Start with the profile's seccomp opt-in set to `RET_LOG`.
-2. Run the worker through its full lifecycle, including error paths
-   and shutdown, under the VMM test suite.
-3. Collect `denied_syscall` events ([§11.3](#113-structured-event-fields)).
-4. Widen the filter from that evidence, with a comment per entry
-   saying which component needs it.
-5. Re-run; iterate until clean.
-6. Flip to `RET_KILL_PROCESS` and re-run the full suite.
+1. Identify a syscall that provides an unnecessary privilege, escape vector,
+   or disproportionately risky kernel attack surface.
+2. Confirm that the affected worker classes do not legitimately require it.
+3. Add it to the mandatory baseline when it is universally inappropriate, or
+   to the relevant profile's additional deny list when role-specific.
+4. Document the security rationale and add focused filter-construction or
+   enforcement coverage.
+5. Run the affected workers through their full lifecycle, including shutdown
+   and error paths.
 
-Step 4's comment requirement matters: an unexplained syscall in an
-allowlist is indistinguishable from an unnecessary one, and it is
-what makes the periodic re-review in
-[§14](#14-open-questions--deferred-work) item 6 possible.
+This trades some theoretical syscall minimization for a policy that can remain
+enabled and maintained as worker link sets, libc, allocators, and toolchains
+change.
 
 ---
 
 ## 13. Migration & rollout
 
-### 13.1 Removing the current implementation
+### 13.1 Process launch integration
 
-Per D10, the existing mechanism is deleted, not adapted. It has
-**zero implementors and zero callers**, so there is no
-back-compatibility constraint:
+The vestigial `mesh_process::SandboxProfile` callback is removed. A caller
+selects a linked `sandbox::Profile` and passes it to
+`ProcessConfig::new_with_sandbox`; Mesh calls `sandbox::prepare` and applies
+the resulting launch data to PAL. Mesh remains unaware of OpenVMM roles:
 
-| To remove | Location |
+| Responsibility | Location |
 |---|---|
-| `Builder` sandbox setters and their application inside the `clone(2)` callback | `support/pal/src/unix/process/linux.rs:186-338` |
-| `SandboxProfile` trait | `support/mesh/mesh_process/src/lib.rs:283-298` |
-| `ProcessConfig::new_with_sandbox` | `support/mesh/mesh_process/src/lib.rs:882-944` |
+| Clone namespace flags and self-ID mapping | `support/pal/src/unix/process.rs`, `support/pal/src/unix/process/linux.rs` |
+| Profile preparation and Mesh bootstrap FD restriction | `support/mesh/mesh_process/src/lib.rs` |
+| OpenVMM role and linked-profile selection | `openvmm/openvmm_entry/src/sandbox_profiles.rs` |
 
-`support/pal` keeps its process-spawning role; it simply stops
-carrying sandbox policy. The process `Builder` it exposes is what
-`support/sandbox` builds on (`ProcessBuilder` in [§6.2](#62-rust-api--three-entry-points)).
+`support/pal` carries only mechanism: clone flags and whether the new
+user namespace receives a self-map. It does not know profiles or OpenVMM
+roles. `support/sandbox` computes policy-derived launch data, and
+`mesh_process` adapts that data to PAL.
 
 ### 13.2 Sequence
 
@@ -2040,7 +2024,7 @@ are genuine deferrals with a documented trigger for revisiting.
 | 3 | **Per-VM identity** — ephemeral per-spawn UIDs (Linux) and per-VM AppContainer names (Windows). | When multi-tenant hosting is a requirement | v1 uses per-worker-class identity on both platforms (D15, [§8.5](#85-appcontainer-profile-lifecycle--naming)). The hardened variant costs identity provisioning and cleanup on both sides. Carried from TSD open q6. |
 | 4 | **Which passed handles are powerful enough to need proxying?** A `/dev/kvm` or VFIO FD carries a large `ioctl` surface. | During per-class profile authoring | Enumerate per worker class; decide raw FD vs. Mesh protocol object vs. seccomp `ioctl` argument filtering. Carried from TSD open q9. |
 | 5 | **Workers that cannot enumerate their resource needs up front.** | If such a worker appears | The seccomp user-notify broker is the answer and the kernel support is present on both baselines; it is deferred only because nothing needs it. Carried from TSD open q3. |
-| 6 | **Periodic residual-syscall-surface re-review.** | Each release, per profile | An allowlist grows monotonically unless someone prunes it. Requires the per-entry comments from [§12.3](#123-profile-development-workflow). |
+| 6 | **Periodic residual-syscall-surface re-review.** | Each release, per profile | Review new kernel interfaces and worker functionality for syscalls that should join the mandatory or role-specific deny sets. Requires the per-entry rationale from [§12.3](#123-profile-development-workflow). |
 | 7 | **Zygote / pre-forked worker pool.** | If spawn latency becomes a problem | Explicitly rejected for v1 (TSD Topic 1). Revisit only with measured latency data; a zygote reintroduces exactly the "state inherited from a process that did other things first" hazard this design eliminates. Carried from TSD open q11. |
 | 8 | **Should this document move into `Guide/`?** | After the first profile ships | The operator-facing parts — deployment surfaces ([§7.6](#76-deployment-surface--degradation-matrix)), the sysctl/AppArmor escapes, the dev-mode hatch — belong in `Guide/`. The design rationale belongs here. |
 
@@ -2068,7 +2052,7 @@ are genuine deferrals with a documented trigger for revisiting.
 | `support/pal/src/unix/process/linux.rs:175-338` | Current `clone(2)` callback; the async-signal-safety violation this design fixes by self-applying instead |
 | `support/mesh/mesh_process/src/lib.rs` | `IPC_FD = 3`, `MESH_WORKER_INVITATION`, `dup_fd`, `try_run_mesh_host` — the Mesh bootstrap the sandbox mirrors ([§10.4](#104-mesh-compatibility)) |
 | `support/mesh/mesh_node/src/resource.rs` | `Resource`/`OsResource` sideband that carries OS handles inside Mesh messages ([§10.4](#104-mesh-compatibility)) |
-| `support/mesh/mesh_process/src/lib.rs:283-298, 882-944` | `SandboxProfile` and `new_with_sandbox` — removed per [§13.1](#131-removing-the-current-implementation) |
+| `support/mesh/mesh_process/src/lib.rs` | `ProcessConfig::new_with_sandbox` accepts the caller-selected profile, prepares its launch data, and enforces the Mesh bootstrap FD restriction |
 | `support/mesh/mesh_protobuf/` | Wire encoding (C6); the `protofile` module can emit `.proto` descriptors |
 | `Guide/src/dev_guide/getting_started/build_ohcl_kernel.md:15-16` | OpenHCL kernel branch `product/hcl-main/6.6` — the basis for R-P1 |
 | `Cargo.toml:641-643, 647-648, 657-660` | `caps`, `landlock`, `seccompiler`, `libc`, `nix`, `windows`, `windows-sys` — all already workspace dependencies |

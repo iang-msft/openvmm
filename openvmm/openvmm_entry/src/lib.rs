@@ -13,6 +13,7 @@ mod kvp;
 mod meshworker;
 mod pidfile;
 mod repl;
+mod sandbox_profiles;
 mod serial_io;
 mod storage_builder;
 mod tracing_init;
@@ -101,6 +102,7 @@ use pal_async::DefaultPool;
 use pal_async::socket::PolledSocket;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
+use sandbox_profiles::SandboxRole;
 use serial_16550_resources::ComPort;
 use serial_core::resources::DisconnectedSerialBackendHandle;
 use sparse_mmap::alloc_shared_memory;
@@ -158,7 +160,11 @@ pub fn openvmm_main() {
         Ok(code) => code,
         Err(err) => {
             eprintln!("fatal error: {:?}", err);
-            1
+            if err.downcast_ref::<sandbox::Error>().is_some() {
+                sandbox::EXIT_SANDBOX_FAILED
+            } else {
+                1
+            }
         }
     };
 
@@ -1651,7 +1657,7 @@ async fn vm_config_from_command_line(
                     bios_guid,
                 }
                 .into_resource(),
-                worker_host: mesh.make_host("tpm", None).await?,
+                worker_host: mesh.make_sandboxed_host(SandboxRole::Tpm, None).await?,
             }
             .into_resource(),
         });
@@ -2654,6 +2660,8 @@ fn prepare_snapshot_restore(
 }
 
 fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> {
+    meshworker::apply_vmm_mesh_host_sandbox()?;
+
     #[cfg(windows)]
     pal::windows::disable_hard_error_dialog();
 
@@ -2878,7 +2886,9 @@ async fn run_control_inner(
     let (vm_rpc, rpc_recv) = mesh::channel();
     let (notify_send, notify_recv) = mesh::channel();
     let vm_worker = {
-        let vm_host = mesh.make_host("vm", opt.log_file.clone()).await?;
+        let vm_host = mesh
+            .make_sandboxed_host(SandboxRole::Vm, opt.log_file.clone())
+            .await?;
 
         let (shared_memory, saved_state) = if let Some(snapshot_dir) = &opt.restore_snapshot {
             let (fd, state_msg) = prepare_snapshot_restore(snapshot_dir, &opt)?;
