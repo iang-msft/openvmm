@@ -1949,7 +1949,7 @@ does not select policy and remains unaware of OpenVMM roles:
 |---|---|
 | Clone namespace flags and self-ID mapping | `support/pal/src/unix/process.rs`, `support/pal/src/unix/process/linux.rs` |
 | Generic process-builder adapter | `support/mesh/mesh_process/src/lib.rs` |
-| OpenVMM role and linked-profile selection | `openvmm/openvmm_entry/src/meshworker.rs` |
+| OpenVMM role and linked-profile selection | `openvmm/openvmm_entry/src/sandbox_profiles.rs` |
 
 `support/pal` carries only mechanism: clone flags and whether the new
 user namespace receives a self-map. It does not know profiles or

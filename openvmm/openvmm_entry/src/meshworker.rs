@@ -16,39 +16,9 @@ use pal_async::task::Spawn;
 use pal_async::task::Task;
 use std::path::PathBuf;
 
+use crate::sandbox_profiles::SandboxRole;
+
 const SANDBOX_ROLE_ARG: &str = "--openvmm-sandbox-role=";
-
-#[derive(Copy, Clone)]
-pub(crate) enum SandboxRole {
-    Vm,
-    Tpm,
-}
-
-impl SandboxRole {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Vm => "vm",
-            Self::Tpm => "tpm",
-        }
-    }
-
-    fn profile(self) -> sandbox::Profile {
-        match self {
-            Self::Vm => sandbox::profiles::minimal()
-                .name(self.name())
-                .read("/usr")
-                .read("/etc")
-                .read("/dev")
-                .syscalls(sandbox::Syscalls::Deny(&["kill"]))
-                .build(),
-            Self::Tpm => sandbox::Profile::deny_all()
-                .name(self.name())
-                .network(sandbox::Network::None)
-                .syscalls(sandbox::Syscalls::Deny(&["kill", "tkill", "tgkill"]))
-                .build(),
-        }
-    }
-}
 
 pub(crate) fn run_vmm_mesh_host() -> anyhow::Result<()> {
     try_run_mesh_host("openvmm", async |params: MeshHostParams| {
