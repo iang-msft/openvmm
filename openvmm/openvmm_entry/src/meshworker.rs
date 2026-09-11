@@ -44,63 +44,11 @@ impl SandboxRole {
             Self::Tpm => sandbox::Profile::deny_all()
                 .name(self.name())
                 .network(sandbox::Network::None)
-                .syscalls(sandbox::Syscalls::Allow(TPM_SYSCALL_ALLOWLIST))
+                .syscalls(sandbox::Syscalls::Deny(&["kill", "tkill", "tgkill"]))
                 .build(),
         }
     }
 }
-
-const TPM_SYSCALL_ALLOWLIST: &[&str] = &[
-    "read",
-    "write",
-    "recvmsg",
-    "sendmsg",
-    "close",
-    "shutdown",
-    "epoll_create1",
-    "epoll_ctl",
-    "epoll_pwait",
-    "eventfd2",
-    "timerfd_create",
-    "timerfd_settime",
-    "ppoll",
-    "getrandom",
-    "mmap",
-    "munmap",
-    "mprotect",
-    "madvise",
-    "brk",
-    "clone",
-    "futex",
-    "rseq",
-    "set_robust_list",
-    "sched_yield",
-    "sched_getaffinity",
-    "gettid",
-    "getpid",
-    "rt_sigaction",
-    "rt_sigprocmask",
-    "rt_sigreturn",
-    "restart_syscall",
-    "sigaltstack",
-    "openat",
-    "pread64",
-    "fstat",
-    "statx",
-    "newfstatat",
-    "faccessat2",
-    "lseek",
-    "fcntl",
-    "dup3",
-    "set_tid_address",
-    "prlimit64",
-    "prctl",
-    "clock_gettime",
-    "clock_getres",
-    "clock_nanosleep",
-    "exit",
-    "exit_group",
-];
 
 pub(crate) fn run_vmm_mesh_host() -> anyhow::Result<()> {
     try_run_mesh_host("openvmm", async |params: MeshHostParams| {

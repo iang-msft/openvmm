@@ -96,7 +96,7 @@ Carried forward from TSD §Non-goals, plus additions:
 | **`prepare`** | Control-process setup done before the child exists, via `sandbox::prepare()`. On Linux: handle hygiene, grant serialization, identity. On Windows: additionally the entire LPAC construction, since there is no post-launch equivalent. |
 | **`apply`** | The worker confining itself, as the first statement of `main()`, via `sandbox::apply()`. On Linux: the *entire* sandbox. On Windows: the post-launch half. |
 | **`tighten`** | Optional progressive tightening, run by the worker after its own initialization completes, via an additive-only `Restrictions` spec. Runs `sandbox::tighten()`. |
-| **Intent** | A platform-neutral capability statement — e.g. `Network::None`, `Syscalls::Allow(...)` — expressed through the widening builder ([§6.1](#61-type-vocabulary)) and translated by each backend into platform primitives. Public. |
+| **Intent** | A platform-neutral capability statement — e.g. `Network::None`, `Syscalls::Deny(...)` — expressed through the widening builder ([§6.1](#61-type-vocabulary)) and translated by each backend into platform primitives. Public. |
 
 ### 1.4 Existing process model: Mesh hosts, workers, and services
 
@@ -716,7 +716,6 @@ pub enum Network { None, Loopback, Unrestricted }
 pub enum Syscalls {
     Unfiltered,
     Deny(&'static [&'static str]),
-    Allow(&'static [&'static str]),
 }
 /// An opaque, named platform capability, constructed from
 /// crate-provided constants (`Capability::LPAC_COM`, …). The consumer
@@ -725,9 +724,9 @@ pub struct Capability(/* opaque */);
 
 /// A narrow, additive-only ratchet for `tighten` — deliberately *not*
 /// a `Profile`. It can express only the primitives that are safe to
-/// stack onto an already-applied sandbox: a strictly smaller syscall
-/// allowlist and a further-restricted Landlock ruleset (Linux → an
-/// additional seccomp filter / tighter Landlock). The one-shot,
+/// stack onto an already-applied sandbox: additional syscall denials
+/// and a further-restricted Landlock ruleset (Linux → an additional
+/// seccomp filter / tighter Landlock). The one-shot,
 /// authority-consuming
 /// primitives — namespaces, credentials, mounts / `pivot_root`,
 /// capability grants — are simply absent from this type, so a
@@ -747,11 +746,10 @@ impl Restrictions {
 pub struct RestrictionsBuilder { /* opaque */ }
 
 impl RestrictionsBuilder {
-    /// Replace the active syscall surface with a strictly smaller
-    /// allowlist, installed as an additional stacked seccomp filter —
-    /// the kernel takes the most restrictive verdict across every
-    /// installed filter.
-    pub fn syscalls(self, allow: &'static [&'static str]) -> Self;
+    /// Deny additional syscalls with a stacked seccomp filter — the
+    /// kernel takes the most restrictive verdict across every installed
+    /// filter.
+    pub fn syscalls(self, deny: &'static [&'static str]) -> Self;
     /// Enforce an additional Landlock ruleset that *removes* access to
     /// a path already permitted by the applied profile; it can never
     /// add access.
@@ -857,11 +855,10 @@ pub fn prepare(
 /// half (Job Object, mitigation policies, token strip). Returns the
 /// pre-Mesh `Handles`.
 ///
-/// A profile may install either the dangerous-syscall deny baseline or a
-/// complete seccomp allowlist. An allowlist is necessarily the union of the
-/// worker's init-time and steady-state syscalls because `apply` runs first;
-/// shedding init-only surface afterward is the job of optional `tighten`
-/// (R-F5). The mandatory dangerous set remains denied in both modes.
+/// A profile may install the dangerous-syscall deny baseline plus
+/// worker-specific additional denials. The denylist is default-allow so it
+/// does not require enumerating the worker's complete initialization and
+/// steady-state syscall surface.
 ///
 /// No-op returning `Handles::empty()` when no grant is present — the
 /// single-process / dev path, mirroring how `try_run_mesh_host`
@@ -875,11 +872,10 @@ pub fn apply(profile: &Profile) -> Result<Handles, Error>;
 
 /// STAGE 3 (optional) — worker, after its own initialization.
 ///
-/// `apply` already installed the worker's entire linked profile,
-/// including the full (init + steady-state) seccomp allowlist. This is
-/// the optional ratchet that sheds the init-only surface once the
-/// worker has finished starting up — received its Mesh resources,
-/// mapped memory, spawned its threads.
+/// `apply` already installed the worker's linked denylist profile. This is
+/// the optional ratchet that adds further syscall denials once the worker has
+/// finished starting up — received its Mesh resources, mapped memory, spawned
+/// its threads.
 ///
 /// It takes `Restrictions` — a narrow, additive-only spec — rather
 /// than a `Profile`, so a non-monotonic ratchet cannot even be written
@@ -1098,7 +1094,7 @@ alternative so it does not get relitigated.
 | **User NS (`CLONE_NEWUSER`)** | **Unprivileged bootstrap** for the other `CLONE_NEW*` calls, and the substrate for the UID remap. | 3.8+ | Not a boundary in its own right in our model. Where the control process already has `CAP_SYS_ADMIN` (OpenHCL), it is still used, because it is what makes the uid_map remap possible. Blocked on some distros — see [§7.6](#76-deployment-surface--degradation-matrix). |
 | **Linux capabilities + securebits** | **Configuration hygiene** (R-S4). Drop all five sets to empty, then lock securebits so they cannot be re-acquired. | Universal | `SECBIT_NOROOT_LOCKED \| SECBIT_NO_SETUID_FIXUP_LOCKED \| SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED`. Without the locked securebits, a UID-0 worker regains caps across `execve`. |
 | **`PR_SET_NO_NEW_PRIVS`** | Prerequisite for unprivileged seccomp and Landlock. | 3.5+ | Set in **`apply`**, right before the filters it enables. Survives `execve` and cannot be cleared. |
-| **seccomp-bpf** | **Syscall surface reduction** (R-S8), **opt-in per worker class** (D13, R-S13). | Universal | Opt-in because the syscall list encodes link-set details — mesh, glibc, allocator, toolchain — that drift (TSD Topic 3). `RET_KILL_PROCESS` in production, `RET_LOG` in dev. Filters stack, which is what makes `tighten` monotonic. Blind to io_uring SQE opcodes — see below. |
+| **seccomp-bpf** | **Dangerous syscall denial** (R-S8), **opt-in per worker class** (D13, R-S13). | Universal | V1 uses a default-allow denylist to avoid maintaining each worker's complete link-set-dependent syscall inventory. The mandatory baseline blocks namespace escapes and historically risky kernel surfaces; profiles may add further denials. `RET_KILL_PROCESS` in production and `EPERM` in debug builds. Filters stack, which makes `tighten` monotonic. Blind to io_uring SQE opcodes — see below. |
 | **Landlock** | **Supplementary FS restriction** (D11), applied opportunistically with ABI-aware degradation (D16). | 5.13+ | Explicitly *not* the primary FS mechanism. On the OpenVMM-host baseline it is ABI 1 only: no `FS_REFER`, no `FS_TRUNCATE`, so it cannot fully restrict cross-directory rename or `O_TRUNC`. Applied *before* seccomp (C7) so the final filter can deny the Landlock syscalls. |
 | **IPC / UTS / cgroup NS** | Cheap defense-in-depth name hiding. Default-on wherever mount NS is on. | Universal | Not boundaries on their own. |
 | **PID NS** | **Omitted in v1** (C2). | — | `unshare(CLONE_NEWPID)` moves only future children; `execve` does not move the caller. R-S6 is met by other means — see the supporting controls below. |
@@ -1622,7 +1618,7 @@ the equivalent table in `Sandbox_architecture.md`.
 | `Filesystem::Rootfs(binds)` | `MS_REC\|MS_PRIVATE` → bind mounts → `MS_REMOUNT` flag fixups → `pivot_root` → `umount2(MNT_DETACH)` | **`apply`** | LPAC opt-out makes the FS default-deny; per-container FS area | `prepare` (inherent) |
 | `Filesystem::LandlockSupplement` | ABI probe → ruleset → `landlock_restrict_self`. **Before seccomp** (C7) | **`apply`** | N/A | — |
 | `NetworkAccess::None` | Empty netns + optional seccomp `EAFNOSUPPORT` on `socket()` | `clone` + **`apply`** | **Omit** `internetClient`, `internetClientServer`, `privateNetworkClientServer` capability SIDs | **`prepare`** |
-| `NetworkAccess::LoopbackOnly` | Netns + bring `lo` up + seccomp allowlist for loopback binds | `clone` + **`apply`** | No network capability SIDs; Job Object network rate control | `prepare` + `apply` |
+| `NetworkAccess::LoopbackOnly` | Netns + bring `lo` up | `clone` + **`apply`** | No network capability SIDs; Job Object network rate control | `prepare` + `apply` |
 | `NetworkAccess::Unrestricted` | Preserve the caller's network namespace | **`prepare`** | Not yet implemented | — |
 | `Handles::AllowlistOnly` | Atomic `O_CLOEXEC` at creation + fixed target mapping and `close_range` in PAL's pre-exec child callback | `prepare` + **`clone`** | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (mandatory) + parent `HANDLE_FLAG_INHERIT` sweep | **`prepare`** |
 | `Privileges::DropAll` | clear ambient → `capset` zero → `PR_CAPBSET_DROP` all → locked securebits | **`apply`** | `AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)` | **`apply`** |
@@ -1837,19 +1833,16 @@ Both `sandbox.degraded` and `sandbox.failed` carry:
 | `errno` / `hresult` | The raw platform error |
 | `class` | `required` or `opportunistic` |
 
-Seccomp denials in `RET_LOG` mode additionally carry `denied_syscall`
-and `arg0`..`arg5`, which is what makes profile development
-tractable: run the worker in dev mode, collect the denial log,
-and widen the filter from evidence rather than from guesswork.
+Seccomp application failures carry the primitive and platform error. V1
+denylist maintenance is review-driven rather than learned from runtime traces:
+new denials require a security rationale and focused enforcement coverage.
 
 ### 11.4 Audit posture
 
-- **Production:** seccomp `RET_KILL_PROCESS`. A denial is a crash,
-  and a crash is a bug — either in the profile or in the worker.
-  There is no "log and allow" in production, because that is
-  indistinguishable from having no filter.
-- **Development:** seccomp `RET_LOG`. Denials are recorded and
-  execution continues.
+- **Production:** seccomp `RET_KILL_PROCESS`. Reaching a denied syscall
+  terminates the worker.
+- **Development:** denied syscalls return `EPERM`, allowing focused tests
+  and local diagnosis without weakening the filter.
 - **Selecting between them** is a build/deploy property, not a
   runtime flag a compromised process could flip (R-O4).
 
@@ -1925,22 +1918,22 @@ such tests is visible and can be driven to zero.
 
 ### 12.3 Profile-development workflow
 
-Deriving a seccomp filter by inspection does not work. The supported
-loop is:
+V1 deliberately uses a default-allow denylist instead of attempting to derive
+complete per-worker syscall inventories. Update the policy as follows:
 
-1. Start with the profile's seccomp opt-in set to `RET_LOG`.
-2. Run the worker through its full lifecycle, including error paths
-   and shutdown, under the VMM test suite.
-3. Collect `denied_syscall` events ([§11.3](#113-structured-event-fields)).
-4. Widen the filter from that evidence, with a comment per entry
-   saying which component needs it.
-5. Re-run; iterate until clean.
-6. Flip to `RET_KILL_PROCESS` and re-run the full suite.
+1. Identify a syscall that provides an unnecessary privilege, escape vector,
+   or disproportionately risky kernel attack surface.
+2. Confirm that the affected worker classes do not legitimately require it.
+3. Add it to the mandatory baseline when it is universally inappropriate, or
+   to the relevant profile's additional deny list when role-specific.
+4. Document the security rationale and add focused filter-construction or
+   enforcement coverage.
+5. Run the affected workers through their full lifecycle, including shutdown
+   and error paths.
 
-Step 4's comment requirement matters: an unexplained syscall in an
-allowlist is indistinguishable from an unnecessary one, and it is
-what makes the periodic re-review in
-[§14](#14-open-questions--deferred-work) item 6 possible.
+This trades some theoretical syscall minimization for a policy that can remain
+enabled and maintained as worker link sets, libc, allocators, and toolchains
+change.
 
 ---
 
@@ -2030,7 +2023,7 @@ are genuine deferrals with a documented trigger for revisiting.
 | 3 | **Per-VM identity** — ephemeral per-spawn UIDs (Linux) and per-VM AppContainer names (Windows). | When multi-tenant hosting is a requirement | v1 uses per-worker-class identity on both platforms (D15, [§8.5](#85-appcontainer-profile-lifecycle--naming)). The hardened variant costs identity provisioning and cleanup on both sides. Carried from TSD open q6. |
 | 4 | **Which passed handles are powerful enough to need proxying?** A `/dev/kvm` or VFIO FD carries a large `ioctl` surface. | During per-class profile authoring | Enumerate per worker class; decide raw FD vs. Mesh protocol object vs. seccomp `ioctl` argument filtering. Carried from TSD open q9. |
 | 5 | **Workers that cannot enumerate their resource needs up front.** | If such a worker appears | The seccomp user-notify broker is the answer and the kernel support is present on both baselines; it is deferred only because nothing needs it. Carried from TSD open q3. |
-| 6 | **Periodic residual-syscall-surface re-review.** | Each release, per profile | An allowlist grows monotonically unless someone prunes it. Requires the per-entry comments from [§12.3](#123-profile-development-workflow). |
+| 6 | **Periodic residual-syscall-surface re-review.** | Each release, per profile | Review new kernel interfaces and worker functionality for syscalls that should join the mandatory or role-specific deny sets. Requires the per-entry rationale from [§12.3](#123-profile-development-workflow). |
 | 7 | **Zygote / pre-forked worker pool.** | If spawn latency becomes a problem | Explicitly rejected for v1 (TSD Topic 1). Revisit only with measured latency data; a zygote reintroduces exactly the "state inherited from a process that did other things first" hazard this design eliminates. Carried from TSD open q11. |
 | 8 | **Should this document move into `Guide/`?** | After the first profile ships | The operator-facing parts — deployment surfaces ([§7.6](#76-deployment-surface--degradation-matrix)), the sysctl/AppArmor escapes, the dev-mode hatch — belong in `Guide/`. The design rationale belongs here. |
 
