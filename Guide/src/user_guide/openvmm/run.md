@@ -116,6 +116,25 @@ The kernel and initrd can be controlled via options:
 * `--initrd <PATH>`: The initial ramdisk image.
 * `-c <STRING>` or `--cmdline <STRING>`: Extra kernel command line options, such as `root=/dev/sda`.
 
+On Linux debug builds, `--worker-trace-dir <DIR>` launches each separate Mesh
+worker process under an in-process `ptrace` collector and writes a versioned
+JSON Lines syscall log per worker named
+`worker-<worker-name>.<pid>.jsonl`. This mode is intended for sandbox-profile
+development and significantly slows worker execution.
+
+Generate a candidate Rust sandbox profile from a trace directory with:
+
+```shell
+cargo run -p sandbox_profile_builder -- <TRACE_DIR> <WORKER>
+```
+
+For example, `<WORKER>` can be `vm` or `dpm`. The tool recursively reads the
+matching worker JSONL files and writes `<worker>_worker.rs` in `<TRACE_DIR>` by
+default. Filesystem observations become directory grants. The generated
+syscall denial list starts with `kill`, `tkill`, and `tgkill`, then removes any
+of those observed in the trace. Network observations are printed and included
+in the generated source without changing `Network::None`.
+
 ### Windows, via UEFI
 
 This example will launch a modern copy of Windows via UEFI, using the `mu_msvm`

@@ -63,6 +63,9 @@ use tracing::Instrument;
 use tracing::instrument;
 use unicycle::FuturesUnordered;
 
+#[cfg(target_os = "linux")]
+mod ptrace;
+
 #[cfg(windows)]
 mod plat {
     pub type IpcNode = mesh_remote::windows::AlpcNode;
@@ -305,6 +308,14 @@ pub struct ProcessConfig {
     skip_worker_arg: bool,
     sandbox_profile: Option<Box<dyn SandboxProfile + Sync>>,
     env_vars: Vec<(OsString, OsString)>,
+    trace: Option<ProcessTraceConfig>,
+}
+
+/// Linux worker syscall-tracing configuration.
+#[derive(Debug, Clone)]
+pub struct ProcessTraceConfig {
+    /// Directory in which the per-worker JSONL trace is written.
+    pub output_dir: PathBuf,
 }
 
 impl ProcessConfig {
@@ -319,6 +330,7 @@ impl ProcessConfig {
             skip_worker_arg: false,
             sandbox_profile: None,
             env_vars: Vec::new(),
+            trace: None,
         }
     }
 
@@ -336,6 +348,7 @@ impl ProcessConfig {
             skip_worker_arg: false,
             sandbox_profile: Some(sandbox_profile),
             env_vars: Vec::new(),
+            trace: None,
         }
     }
 
@@ -381,6 +394,19 @@ impl ProcessConfig {
         self.stderr = file;
         self
     }
+
+    /// Enables structured syscall tracing for this process on Linux.
+    pub fn trace(mut self, trace: ProcessTraceConfig) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+}
+
+#[cfg(unix)]
+enum UnixMeshChild {
+    Normal(pal_async::process::PolledChild<pal::unix::process::Child>),
+    #[cfg(target_os = "linux")]
+    Traced(ptrace::TracedChild),
 }
 
 struct MeshInner {
@@ -937,6 +963,11 @@ impl MeshInner {
                 command.stderr(process::Stdio::Fd(log_file.as_fd()));
             }
 
+            #[cfg(target_os = "linux")]
+            if config.trace.is_some() {
+                command.set_trace_before_exec(true);
+            }
+
             if let Some(mut sandbox_profile) = config.sandbox_profile {
                 sandbox_profile.apply(&mut command);
             }
@@ -948,8 +979,36 @@ impl MeshInner {
             pid = child.id();
             tracing::Span::current().record("pid", pid);
 
-            pal_async::process::PolledChild::<process::Child>::new(&self.node_driver, child)
-                .expect("failed to create process wait")
+            #[cfg(target_os = "linux")]
+            if let Some(trace) = config.trace {
+                UnixMeshChild::Traced(
+                    ptrace::TracedChild::start(child, &name, trace)
+                        .context("failed to start worker tracer")?,
+                )
+            } else {
+                UnixMeshChild::Normal(
+                    pal_async::process::PolledChild::<process::Child>::new(
+                        &self.node_driver,
+                        child,
+                    )
+                    .expect("failed to create process wait"),
+                )
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::ensure!(
+                    config.trace.is_none(),
+                    "worker syscall tracing is supported only on Linux"
+                );
+                UnixMeshChild::Normal(
+                    pal_async::process::PolledChild::<process::Child>::new(
+                        &self.node_driver,
+                        child,
+                    )
+                    .expect("failed to create process wait"),
+                )
+            }
         };
 
         let id = self.hosts.insert(MeshHostInner {
@@ -992,12 +1051,13 @@ async fn wait_mesh_child(mut child: pal_async::windows::PolledProcess, name: &st
 }
 
 #[cfg(unix)]
-async fn wait_mesh_child(
-    mut child: pal_async::process::PolledChild<pal::unix::process::Child>,
-    name: &str,
-    pid: i32,
-) {
-    match child.wait().await {
+async fn wait_mesh_child(mut child: UnixMeshChild, name: &str, pid: i32) {
+    let result = match &mut child {
+        UnixMeshChild::Normal(child) => child.wait().await,
+        #[cfg(target_os = "linux")]
+        UnixMeshChild::Traced(child) => child.wait().await,
+    };
+    match result {
         Ok(status) if status.code() == Some(0) => {
             tracing::info!(pid, name, "mesh child exited successfully");
         }

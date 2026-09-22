@@ -3,7 +3,10 @@
 
 [workspace]
 resolver = "2"
-default-members = ["openvmm/openvmm"]
+default-members = [
+  "openvmm/openvmm",
+  "support/sandbox_profile_builder",
+]
 members = [
   # openvmm
   "openvmm/openvmm",
@@ -54,6 +57,7 @@ members = [
   "petri/make_imc_hive",
   "petri/petri-tool",
   "support/sandbox_test_launcher",
+  "support/sandbox_profile_builder",
   "vm/devices/get/test_igvm_agent_rpc_server",
   "vm/devices/tpm/tpm_guest_tests",
   "vm/loader/igvmfilegen",

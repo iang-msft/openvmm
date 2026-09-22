@@ -2740,7 +2740,12 @@ fn new_hvsock_service_id(port: u32) -> Guid {
 }
 
 async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32> {
-    let mut mesh = Some(VmmMesh::new(&driver, opt.single_process)?);
+    let mut mesh = Some(VmmMesh::new(
+        &driver,
+        opt.single_process,
+        #[cfg(target_os = "linux")]
+        opt.worker_trace_dir.clone(),
+    )?);
     let result = run_control_inner(driver, &mut mesh, opt).await;
     // If setup failed before the mesh was handed to the controller, shut it
     // down so the child host process exits cleanly without noisy logs.

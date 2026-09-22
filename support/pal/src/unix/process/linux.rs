@@ -36,6 +36,7 @@ struct CloneContext<'a> {
     bounding_capabilities: Option<CapsHashSet>,
     landlock_rules: Option<RulesetCreated>,
     seccomp_filter: Option<SeccompFilter>,
+    trace_before_exec: bool,
 }
 
 impl Builder<'_> {
@@ -71,6 +72,7 @@ impl Builder<'_> {
             bounding_capabilities: self.linux_builder.bounding_capabilities.clone(),
             landlock_rules,
             seccomp_filter: self.linux_builder.seccomp_filter.clone(),
+            trace_before_exec: self.linux_builder.trace_before_exec,
         };
 
         // Use CLONE_VM and CLONE_VFORK so that the new process will share the
@@ -80,7 +82,8 @@ impl Builder<'_> {
         // Use CLONE_PIDFD to get an fd back to use for polling.
         let mut flags = self.linux_builder.clone_flags | libc::CLONE_PIDFD | libc::SIGCHLD;
 
-        if self.linux_builder.vfork {
+        let using_vfork = self.linux_builder.vfork && !self.linux_builder.trace_before_exec;
+        if using_vfork {
             flags |= libc::CLONE_VM | libc::CLONE_VFORK;
         }
 
@@ -140,7 +143,7 @@ impl Builder<'_> {
         // This can only be done if we are vforking, without sharing another
         // type of status object we can't determine if the execve failed or
         // the process failed during early initialization.
-        if self.linux_builder.vfork && context.result != Some(0) {
+        if using_vfork && context.result != Some(0) {
             // The new process failed without successfully calling execve. Reap
             // it and return the associated error code (which may come from
             // context or from the exit code).
@@ -317,6 +320,14 @@ extern "C" fn clone_cb(context: *mut libc::c_void) -> libc::c_int {
             if seccompiler::apply_filter(&bpf_program).is_err() {
                 handle_sandbox_failure!("failed to apply seccomp profile", libc::ENOTSUP);
             }
+        }
+    }
+
+    if context.trace_before_exec {
+        // SAFETY: raise has no memory-safety requirements. The parent requested
+        // this stop and disabled vfork so it can attach a ptrace supervisor.
+        if unsafe { libc::raise(libc::SIGSTOP) } < 0 {
+            return errno().0;
         }
     }
 
