@@ -7,8 +7,12 @@
 #![expect(unsafe_code)]
 
 use crate::ProcessTraceConfig;
+use seccompiler::SeccompAction;
+use seccompiler::SeccompFilter;
+use seccompiler::TargetArch;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
@@ -25,6 +29,61 @@ use std::time::UNIX_EPOCH;
 
 const MAX_STRING_LEN: usize = 16 * 1024;
 const TRACE_BUFFER_CAPACITY: usize = 256 * 1024;
+
+pub fn seccomp_filter() -> io::Result<SeccompFilter> {
+    let rules = traced_syscall_nrs()
+        .iter()
+        .copied()
+        .map(|sys_nr| (sys_nr, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Trace(0),
+        target_arch(),
+    )
+    .map_err(|error| io::Error::other(format!("seccomp filter creation failed: {error}")))
+}
+
+fn target_arch() -> TargetArch {
+    #[cfg(target_arch = "x86_64")]
+    {
+        TargetArch::x86_64
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        TargetArch::aarch64
+    }
+}
+
+fn traced_syscall_nrs() -> &'static [libc::c_long] {
+    &[
+        libc::SYS_openat,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_readlinkat,
+        libc::SYS_faccessat,
+        libc::SYS_faccessat2,
+        libc::SYS_mkdirat,
+        libc::SYS_unlinkat,
+        libc::SYS_renameat2,
+        libc::SYS_dup,
+        libc::SYS_dup3,
+        libc::SYS_fcntl,
+        libc::SYS_close,
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_bind,
+        libc::SYS_connect,
+        libc::SYS_listen,
+        libc::SYS_accept4,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_kill,
+        libc::SYS_tkill,
+        libc::SYS_tgkill,
+    ]
+}
 
 pub struct TracedChild {
     completion: Option<mesh::OneshotReceiver<io::Result<ExitStatus>>>,
@@ -134,18 +193,21 @@ fn trace_worker(
         let signal = libc::WSTOPSIG(status);
         let event = status >> 16;
         if signal == (libc::SIGTRAP | 0x80) {
-            handle_syscall_stop(&mut output, root_pid, tid, tasks.entry(tid).or_default())?;
+            handle_syscall_exit(&mut output, root_pid, tid, tasks.entry(tid).or_default())?;
+            resume_cont(tid, 0)?;
+        } else if signal == libc::SIGTRAP && event == libc::PTRACE_EVENT_SECCOMP {
+            handle_seccomp_stop(tid, tasks.entry(tid).or_default())?;
             resume_syscall(tid, 0)?;
         } else if signal == libc::SIGTRAP && event != 0 {
             handle_ptrace_event(&mut output, root_pid, tid, event, &mut tasks)?;
-            resume_syscall(tid, 0)?;
+            resume_task(tid, tasks.get(&tid).is_some_and(Option::is_some), 0)?;
         } else {
             let deliver = if signal == libc::SIGSTOP || signal == libc::SIGTRAP {
                 0
             } else {
                 signal
             };
-            resume_syscall(tid, deliver)?;
+            resume_task(tid, tasks.get(&tid).is_some_and(Option::is_some), deliver)?;
         }
     }
 }
@@ -208,7 +270,38 @@ fn handle_ptrace_event(
     )
 }
 
-fn handle_syscall_stop(
+fn handle_seccomp_stop(tid: i32, pending: &mut Option<PendingSyscall>) -> io::Result<()> {
+    let mut info = MaybeUninit::<libc::ptrace_syscall_info>::zeroed();
+    let size = size_of::<libc::ptrace_syscall_info>();
+    ptrace(
+        libc::PTRACE_GET_SYSCALL_INFO,
+        tid,
+        size,
+        info.as_mut_ptr() as usize,
+    )?;
+    // SAFETY: the kernel initialized the structure after a successful ptrace.
+    let info = unsafe { info.assume_init() };
+
+    if info.op != libc::PTRACE_SYSCALL_INFO_SECCOMP {
+        return Err(io::Error::other(format!(
+            "unexpected syscall info operation {} at seccomp stop",
+            info.op
+        )));
+    }
+
+    // SAFETY: op identifies the active union member.
+    let entry = unsafe { info.u.seccomp };
+    let sys_nr = entry.nr;
+    *pending = Some(PendingSyscall {
+        sys_nr,
+        args: entry.args,
+        started: Instant::now(),
+        decoded_args: decode_args(tid, sys_nr, entry.args),
+    });
+    Ok(())
+}
+
+fn handle_syscall_exit(
     output: &mut BufWriter<File>,
     root_pid: i32,
     tid: i32,
@@ -224,44 +317,34 @@ fn handle_syscall_stop(
     )?;
     // SAFETY: the kernel initialized the structure after a successful ptrace.
     let info = unsafe { info.assume_init() };
-
-    match info.op {
-        libc::PTRACE_SYSCALL_INFO_ENTRY => {
-            // SAFETY: op identifies the active union member.
-            let entry = unsafe { info.u.entry };
-            let sys_nr = entry.nr;
-            *pending = Some(PendingSyscall {
-                sys_nr,
-                args: entry.args,
-                started: Instant::now(),
-                decoded_args: decode_args(tid, sys_nr, entry.args),
-            });
-        }
-        libc::PTRACE_SYSCALL_INFO_EXIT => {
-            // SAFETY: op identifies the active union member.
-            let exit = unsafe { info.u.exit };
-            let Some(entry) = pending.take() else {
-                return Ok(());
-            };
-            write_event(
-                output,
-                json!({
-                    "event": "syscall",
-                    "timestamp_ns": unix_timestamp_ns(),
-                    "pid": root_pid,
-                    "tid": tid,
-                    "syscall": syscall_name(entry.sys_nr),
-                    "sys_nr": entry.sys_nr,
-                    "args": entry.args,
-                    "decoded_args": entry.decoded_args,
-                    "result": exit.sval,
-                    "errno": (exit.is_error != 0).then(|| -exit.sval),
-                    "duration_ns": entry.started.elapsed().as_nanos(),
-                }),
-            )?;
-        }
-        _ => {}
+    if info.op != libc::PTRACE_SYSCALL_INFO_EXIT {
+        return Err(io::Error::other(format!(
+            "unexpected syscall info operation {} at syscall exit stop",
+            info.op
+        )));
     }
+
+    // SAFETY: op identifies the active union member.
+    let exit = unsafe { info.u.exit };
+    let entry = pending
+        .take()
+        .ok_or_else(|| io::Error::other("syscall exit stop has no pending seccomp event"))?;
+    write_event(
+        output,
+        json!({
+            "event": "syscall",
+            "timestamp_ns": unix_timestamp_ns(),
+            "pid": root_pid,
+            "tid": tid,
+            "syscall": syscall_name(entry.sys_nr),
+            "sys_nr": entry.sys_nr,
+            "args": entry.args,
+            "decoded_args": entry.decoded_args,
+            "result": exit.sval,
+            "errno": (exit.is_error != 0).then(|| -exit.sval),
+            "duration_ns": entry.started.elapsed().as_nanos(),
+        }),
+    )?;
     Ok(())
 }
 
@@ -364,11 +447,31 @@ fn trace_options() -> libc::c_long {
         | libc::PTRACE_O_TRACECLONE
         | libc::PTRACE_O_TRACEEXEC
         | libc::PTRACE_O_TRACEEXIT
+        | libc::PTRACE_O_TRACESECCOMP
         | libc::PTRACE_O_EXITKILL) as libc::c_long
 }
 
+fn resume_task(tid: i32, awaiting_syscall_exit: bool, signal: i32) -> io::Result<()> {
+    if awaiting_syscall_exit {
+        resume_syscall(tid, signal)
+    } else {
+        resume_cont(tid, signal)
+    }
+}
+
+fn resume_cont(tid: i32, signal: i32) -> io::Result<()> {
+    resume_ptrace(libc::PTRACE_CONT, tid, signal)
+}
+
 fn resume_syscall(tid: i32, signal: i32) -> io::Result<()> {
-    ptrace(libc::PTRACE_SYSCALL, tid, 0, signal as usize)
+    resume_ptrace(libc::PTRACE_SYSCALL, tid, signal)
+}
+
+fn resume_ptrace(request: libc::c_uint, tid: i32, signal: i32) -> io::Result<()> {
+    match ptrace(request, tid, 0, signal as usize) {
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        result => result,
+    }
 }
 
 fn ptrace(request: libc::c_uint, pid: i32, address: usize, data: usize) -> io::Result<()> {
@@ -432,7 +535,7 @@ mod tests {
     fn traces_process_to_json_lines() {
         let dir = tempfile::tempdir().unwrap();
         let mut command = pal::unix::process::Builder::new("/usr/bin/true");
-        command.set_trace_before_exec(true);
+        command.set_trace_seccomp_filter(seccomp_filter().unwrap());
         let child = command.spawn().unwrap();
         let pid = child.id();
         let mut traced = TracedChild::start(
@@ -465,6 +568,13 @@ mod tests {
                 && event.get("number").is_none()
                 && event.get("details").is_none()
         }));
+        assert!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "syscall")
+                .all(|event| traced_syscall_nrs()
+                    .contains(&(event["sys_nr"].as_i64().unwrap() as i64)))
+        );
         assert!(events.iter().any(|event| event["event"] == "task_exit"));
     }
 }

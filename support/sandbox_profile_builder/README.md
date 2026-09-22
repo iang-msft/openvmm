@@ -39,15 +39,18 @@ target/debug/openvmm \
     --com1 console
 ```
 
-OpenVMM launches each separate Mesh worker under the in-process `ptrace`
-collector. Each worker produces one JSON Lines file:
+OpenVMM launches each separate Mesh worker under the in-process
+seccomp-assisted `ptrace` collector. Each worker produces one JSON Lines file:
 
 ```text
 worker-<worker-name>.<pid>.jsonl
 ```
 
-Tracing significantly slows worker execution and is intended for profile
-development. It is not supported with OpenVMM single-process mode.
+The seccomp filter reports only profile-relevant filesystem, network,
+file-descriptor tracking, and signal syscalls to ptrace. Other syscalls,
+including high-frequency virtualization operations, run without ptrace stops.
+Tracing is intended for profile development and is not supported with OpenVMM
+single-process mode.
 
 ## Generate a profile
 

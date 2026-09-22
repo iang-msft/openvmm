@@ -965,7 +965,9 @@ impl MeshInner {
 
             #[cfg(target_os = "linux")]
             if config.trace.is_some() {
-                command.set_trace_before_exec(true);
+                command.set_trace_seccomp_filter(
+                    ptrace::seccomp_filter().context("failed to build worker trace filter")?,
+                );
             }
 
             if let Some(mut sandbox_profile) = config.sandbox_profile {

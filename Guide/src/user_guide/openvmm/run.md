@@ -117,10 +117,11 @@ The kernel and initrd can be controlled via options:
 * `-c <STRING>` or `--cmdline <STRING>`: Extra kernel command line options, such as `root=/dev/sda`.
 
 On Linux debug builds, `--worker-trace-dir <DIR>` launches each separate Mesh
-worker process under an in-process `ptrace` collector and writes a versioned
-JSON Lines syscall log per worker named
-`worker-<worker-name>.<pid>.jsonl`. This mode is intended for sandbox-profile
-development and significantly slows worker execution.
+worker process under an in-process seccomp-assisted `ptrace` collector and
+writes a JSON Lines syscall log per worker named
+`worker-<worker-name>.<pid>.jsonl`. The seccomp filter reports only
+profile-relevant filesystem, network, file-descriptor tracking, and signal
+syscalls to ptrace so high-frequency virtualization syscalls run normally.
 
 Generate a candidate Rust sandbox profile from a trace directory with:
 

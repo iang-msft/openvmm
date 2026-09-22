@@ -4669,6 +4669,7 @@ dependencies = [
  "mesh_remote",
  "pal",
  "pal_async",
+ "seccompiler",
  "serde_json",
  "slab",
  "tempfile",

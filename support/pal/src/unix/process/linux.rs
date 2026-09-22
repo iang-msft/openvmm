@@ -36,7 +36,7 @@ struct CloneContext<'a> {
     bounding_capabilities: Option<CapsHashSet>,
     landlock_rules: Option<RulesetCreated>,
     seccomp_filter: Option<SeccompFilter>,
-    trace_before_exec: bool,
+    trace_seccomp_filter: Option<SeccompFilter>,
 }
 
 impl Builder<'_> {
@@ -72,7 +72,7 @@ impl Builder<'_> {
             bounding_capabilities: self.linux_builder.bounding_capabilities.clone(),
             landlock_rules,
             seccomp_filter: self.linux_builder.seccomp_filter.clone(),
-            trace_before_exec: self.linux_builder.trace_before_exec,
+            trace_seccomp_filter: self.linux_builder.trace_seccomp_filter.clone(),
         };
 
         // Use CLONE_VM and CLONE_VFORK so that the new process will share the
@@ -82,7 +82,8 @@ impl Builder<'_> {
         // Use CLONE_PIDFD to get an fd back to use for polling.
         let mut flags = self.linux_builder.clone_flags | libc::CLONE_PIDFD | libc::SIGCHLD;
 
-        let using_vfork = self.linux_builder.vfork && !self.linux_builder.trace_before_exec;
+        let using_vfork =
+            self.linux_builder.vfork && self.linux_builder.trace_seccomp_filter.is_none();
         if using_vfork {
             flags |= libc::CLONE_VM | libc::CLONE_VFORK;
         }
@@ -315,6 +316,14 @@ extern "C" fn clone_cb(context: *mut libc::c_void) -> libc::c_int {
     set_capabilities!(caps::CapSet::Inheritable, inheritable_capabilities);
     set_capabilities!(caps::CapSet::Effective, effective_capabilities);
 
+    if context.trace_seccomp_filter.is_some() {
+        // SAFETY: raise has no memory-safety requirements. The parent requested
+        // this stop and disabled vfork so it can attach a ptrace supervisor.
+        if unsafe { libc::raise(libc::SIGSTOP) } < 0 {
+            return errno().0;
+        }
+    }
+
     if let Some(seccomp_filter) = context.seccomp_filter.take() {
         if let Ok(bpf_program) = TryInto::<seccompiler::BpfProgram>::try_into(seccomp_filter) {
             if seccompiler::apply_filter(&bpf_program).is_err() {
@@ -323,11 +332,11 @@ extern "C" fn clone_cb(context: *mut libc::c_void) -> libc::c_int {
         }
     }
 
-    if context.trace_before_exec {
-        // SAFETY: raise has no memory-safety requirements. The parent requested
-        // this stop and disabled vfork so it can attach a ptrace supervisor.
-        if unsafe { libc::raise(libc::SIGSTOP) } < 0 {
-            return errno().0;
+    if let Some(seccomp_filter) = context.trace_seccomp_filter.take() {
+        if let Ok(bpf_program) = TryInto::<seccompiler::BpfProgram>::try_into(seccomp_filter) {
+            if seccompiler::apply_filter(&bpf_program).is_err() {
+                return libc::ENOTSUP;
+            }
         }
     }
 
