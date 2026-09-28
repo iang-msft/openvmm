@@ -182,7 +182,7 @@ pub enum Network {
 /// instead blocks a curated set of syscalls that a sandboxed worker never
 /// legitimately needs and that are known namespace-escape or kernel-CVE
 /// vectors.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Syscalls {
     /// Install no seccomp filter. The worker retains the ambient syscall
     /// surface; confinement rests on namespaces, credentials, and
@@ -196,7 +196,18 @@ pub enum Syscalls {
     /// additionally blocks every syscall named here. An empty list installs
     /// just the built-in baseline. Unknown names are a hard error at apply
     /// time.
-    Deny(&'static [&'static str]),
+    Deny(Vec<String>),
+}
+
+impl Syscalls {
+    /// Deny the supplied syscall names in addition to the built-in baseline.
+    pub fn deny<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::Deny(names.into_iter().map(Into::into).collect())
+    }
 }
 
 /// An opaque, named platform capability, constructed from crate-provided
@@ -366,11 +377,11 @@ mod tests {
     #[test]
     fn syscalls_deny_is_stored() {
         let profile = Profile::deny_all()
-            .syscalls(Syscalls::Deny(&["socket"]))
+            .syscalls(Syscalls::deny(["socket"]))
             .build();
-        assert!(matches!(
+        assert_eq!(
             profile.inner.syscalls,
-            Syscalls::Deny(&["socket"])
-        ));
+            Syscalls::Deny(vec!["socket".to_string()])
+        );
     }
 }

@@ -10,10 +10,15 @@
 
 use sandbox::Identity;
 use sandbox::Restrictions;
+use sandbox::Syscalls;
 use sandbox::profiles;
 
 fn main() -> anyhow::Result<()> {
-    let profile = profiles::minimal().name("sandbox_test_launcher").build();
+    let syscall_denials = sandbox::load_platform_syscall_denylist()?;
+    let profile = profiles::minimal()
+        .name("sandbox_test_launcher")
+        .syscalls(Syscalls::deny(syscall_denials))
+        .build();
     let preparation = sandbox::prepare(&profile, &Identity::default(), &[])?;
 
     #[cfg(target_os = "linux")]

@@ -8,9 +8,11 @@
 use anyhow::Context;
 use anyhow::ensure;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::BufRead;
+use std::net::IpAddr;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -23,7 +25,36 @@ const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_TMPFILE: u64 = 0o20_200_000;
 const AF_UNIX: u64 = 1;
-const DEFAULT_SYSCALL_DENYLIST: [&str; 3] = ["kill", "tkill", "tgkill"];
+const AF_INET: u64 = 2;
+const AF_INET6: u64 = 10;
+const TRACED_SYSCALL_ALLOWLIST: [&str; 26] = [
+    "openat",
+    "newfstatat",
+    "statx",
+    "readlinkat",
+    "faccessat",
+    "faccessat2",
+    "mkdirat",
+    "unlinkat",
+    "renameat2",
+    "dup",
+    "dup3",
+    "fcntl",
+    "close",
+    "socket",
+    "socketpair",
+    "bind",
+    "connect",
+    "listen",
+    "accept4",
+    "sendto",
+    "recvfrom",
+    "sendmsg",
+    "recvmsg",
+    "kill",
+    "tkill",
+    "tgkill",
+];
 
 /// Inputs used to generate one worker profile.
 #[derive(Debug)]
@@ -34,6 +65,8 @@ pub struct BuildOptions {
     pub worker: String,
     /// Directory where the generated Rust source file is written.
     pub output_dir: PathBuf,
+    /// Optional syscall denylist JSON path. Uses the current platform's file when omitted.
+    pub syscall_denylist_path: Option<PathBuf>,
 }
 
 /// Summary of a generated profile.
@@ -41,6 +74,8 @@ pub struct BuildOptions {
 pub struct BuildReport {
     /// Generated Rust source file.
     pub profile_path: PathBuf,
+    /// Syscall denylist JSON file used to generate the profile.
+    pub syscall_denylist_path: PathBuf,
     /// Trace files consumed.
     pub trace_files: Vec<PathBuf>,
     /// Read-only directory grants emitted.
@@ -49,6 +84,8 @@ pub struct BuildReport {
     pub read_write_paths: Vec<PathBuf>,
     /// Network operations observed in the trace.
     pub network_observations: Vec<String>,
+    /// Network policy generated from the trace.
+    pub generated_network: sandbox::Network,
     /// Filesystem behavior that was not converted into an explicit grant.
     pub filesystem_notes: Vec<String>,
     /// Syscall names observed in the trace.
@@ -64,8 +101,16 @@ struct Evidence {
     network_observations: BTreeSet<String>,
     filesystem_notes: BTreeSet<String>,
     syscalls: BTreeSet<String>,
-    unknown_syscall_nrs: BTreeSet<u64>,
-    network_fds: BTreeSet<i64>,
+    network_fds: BTreeMap<i64, NetworkScope>,
+    network_scope: NetworkScope,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum NetworkScope {
+    #[default]
+    None,
+    Loopback,
+    Unrestricted,
 }
 
 /// Generate a sandbox profile template from worker trace evidence.
@@ -87,6 +132,12 @@ pub fn build_profile(options: &BuildOptions) -> anyhow::Result<BuildReport> {
         options.worker,
         options.trace_dir.display()
     );
+    let syscall_denylist_path = options
+        .syscall_denylist_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(sandbox::platform_syscall_denylist_path)?;
+    let default_syscall_denials = sandbox::load_syscall_denylist(&syscall_denylist_path)?;
 
     let mut evidence = Evidence::default();
     for path in &trace_files {
@@ -97,23 +148,29 @@ pub fn build_profile(options: &BuildOptions) -> anyhow::Result<BuildReport> {
     fs_err::create_dir_all(&options.output_dir)
         .with_context(|| format!("failed to create {}", options.output_dir.display()))?;
     let profile_path = options.output_dir.join(format!("{module_name}.rs"));
-    let source = render_profile(&options.worker, &module_name, &trace_files, &evidence);
+    let source = render_profile(
+        &options.worker,
+        &module_name,
+        &trace_files,
+        &evidence,
+        &default_syscall_denials,
+    );
     fs_err::write(&profile_path, source)
         .with_context(|| format!("failed to write {}", profile_path.display()))?;
-    let generated_syscall_denials = generated_syscall_denials(&evidence);
+    let generated_syscall_denials = generated_syscall_denials(&default_syscall_denials, &evidence);
+    let generated_network = evidence.network_scope.into();
 
     Ok(BuildReport {
         profile_path,
+        syscall_denylist_path,
         trace_files,
         read_paths: evidence.read_paths.into_iter().collect(),
         read_write_paths: evidence.read_write_paths.into_iter().collect(),
         network_observations: evidence.network_observations.into_iter().collect(),
+        generated_network,
         filesystem_notes: evidence.filesystem_notes.into_iter().collect(),
         syscalls: evidence.syscalls.into_iter().collect(),
-        generated_syscall_denials: generated_syscall_denials
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        generated_syscall_denials,
     })
 }
 
@@ -150,6 +207,7 @@ fn find_worker_traces(root: &Path, worker: &str) -> anyhow::Result<Vec<PathBuf>>
 }
 
 fn ingest_trace(path: &Path, evidence: &mut Evidence) -> anyhow::Result<()> {
+    evidence.network_fds.clear();
     let file = fs_err::File::open(path)
         .with_context(|| format!("failed to open trace {}", path.display()))?;
     for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
@@ -161,26 +219,25 @@ fn ingest_trace(path: &Path, evidence: &mut Evidence) -> anyhow::Result<()> {
             continue;
         }
 
-        let syscall = event["syscall"].as_str().unwrap_or("unknown");
-        let sys_nr = event["sys_nr"]
-            .as_u64()
-            .or_else(|| event["number"].as_u64());
-        if syscall == "unknown" {
-            if let Some(sys_nr) = sys_nr {
-                if let Some(name) = default_syscall_name(sys_nr) {
-                    evidence.syscalls.insert(name.to_string());
-                } else {
-                    evidence.unknown_syscall_nrs.insert(sys_nr);
-                }
-            }
-        } else {
-            evidence.syscalls.insert(syscall.to_string());
-        }
-
-        let args = parse_args(&event);
-        observe_network(syscall, args, event["result"].as_i64(), evidence);
+        let Some(syscall) = event["syscall"]
+            .as_str()
+            .filter(|syscall| TRACED_SYSCALL_ALLOWLIST.contains(syscall))
+        else {
+            continue;
+        };
+        evidence.syscalls.insert(syscall.to_string());
 
         let decoded = event.get("decoded_args").or_else(|| event.get("details"));
+        let args = parse_args(&event);
+        observe_network(
+            syscall,
+            args,
+            event["result"].as_i64(),
+            event["errno"].as_i64(),
+            decoded,
+            evidence,
+        );
+
         let Some(path) = decoded
             .and_then(|decoded| decoded.get("path"))
             .and_then(Value::as_str)
@@ -269,35 +326,83 @@ fn path_is_written(syscall: &str, args: [u64; 6]) -> bool {
     }
 }
 
-fn observe_network(syscall: &str, args: [u64; 6], result: Option<i64>, evidence: &mut Evidence) {
+fn observe_network(
+    syscall: &str,
+    args: [u64; 6],
+    result: Option<i64>,
+    errno: Option<i64>,
+    decoded: Option<&Value>,
+    evidence: &mut Evidence,
+) {
     match syscall {
         "socket" => {
             let domain = args[0];
-            if domain != AF_UNIX {
+            if let Some(fd) = result.filter(|result| *result >= 0)
+                && domain != AF_UNIX
+            {
                 evidence.network_observations.insert(format!(
                     "`socket` requested address family {}.",
                     address_family_name(domain)
                 ));
-                if let Some(fd) = result.filter(|fd| *fd >= 0) {
-                    evidence.network_fds.insert(fd);
+                if matches!(domain, AF_INET | AF_INET6) {
+                    evidence.network_fds.insert(fd, NetworkScope::None);
                 }
             }
         }
         "accept4" => {
-            if evidence.network_fds.contains(&(args[0] as i64)) {
+            if let (Some(listener_scope), Some(accepted_fd)) = (
+                evidence.network_fds.get(&(args[0] as i64)).copied(),
+                result.filter(|result| *result >= 0),
+            ) {
+                let scope = if listener_scope == NetworkScope::None {
+                    NetworkScope::Unrestricted
+                } else {
+                    listener_scope
+                };
                 evidence
                     .network_observations
                     .insert(format!("`accept4` used network fd {}.", args[0]));
-                if let Some(fd) = result.filter(|fd| *fd >= 0) {
-                    evidence.network_fds.insert(fd);
-                }
+                evidence.network_fds.insert(accepted_fd, scope);
+                evidence.network_scope = evidence.network_scope.max(scope);
             }
         }
-        "connect" | "bind" | "listen" | "sendmsg" | "recvmsg" => {
-            if evidence.network_fds.contains(&(args[0] as i64)) {
+        "connect" | "bind" | "sendto" if syscall_succeeded(syscall, result, errno) => {
+            let fd = args[0] as i64;
+            if let Some((scope, endpoint)) = socket_address_scope(decoded) {
+                evidence.network_fds.entry(fd).or_default();
                 evidence
                     .network_observations
-                    .insert(format!("`{syscall}` used network fd {}.", args[0]));
+                    .insert(format!("`{syscall}` used {endpoint}."));
+                widen_network_fd(fd, scope, evidence);
+            } else if let Some(current_scope) = evidence.network_fds.get(&fd).copied() {
+                let (scope, endpoint) = {
+                    let scope = if syscall == "sendto" && current_scope != NetworkScope::None {
+                        current_scope
+                    } else {
+                        NetworkScope::Unrestricted
+                    };
+                    (scope, "an unknown address".to_string())
+                };
+                evidence
+                    .network_observations
+                    .insert(format!("`{syscall}` used {endpoint}."));
+                widen_network_fd(fd, scope, evidence);
+            }
+        }
+        "listen" | "recvfrom" | "sendmsg" | "recvmsg"
+            if result.is_some_and(|result| result >= 0) =>
+        {
+            let fd = args[0] as i64;
+            if let Some(scope) = evidence.network_fds.get(&fd).copied() {
+                let scope = if scope == NetworkScope::None {
+                    NetworkScope::Unrestricted
+                } else {
+                    scope
+                };
+                evidence
+                    .network_observations
+                    .insert(format!("`{syscall}` used network fd {fd}."));
+                widen_network_fd(fd, scope, evidence);
             }
         }
         "dup" => copy_network_fd(args[0], result, evidence),
@@ -314,10 +419,56 @@ fn observe_network(syscall: &str, args: [u64; 6], result: Option<i64>, evidence:
     }
 }
 
+fn syscall_succeeded(syscall: &str, result: Option<i64>, errno: Option<i64>) -> bool {
+    if result.is_some_and(|result| result >= 0) {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        syscall == "connect" && errno == Some(libc::EINPROGRESS as i64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (syscall, errno);
+        false
+    }
+}
+
 fn copy_network_fd(source: u64, destination: Option<i64>, evidence: &mut Evidence) {
-    if evidence.network_fds.contains(&(source as i64)) {
-        if let Some(destination) = destination.filter(|fd| *fd >= 0) {
-            evidence.network_fds.insert(destination);
+    if let (Some(scope), Some(destination)) = (
+        evidence.network_fds.get(&(source as i64)).copied(),
+        destination.filter(|fd| *fd >= 0),
+    ) {
+        evidence.network_fds.insert(destination, scope);
+    }
+}
+
+fn socket_address_scope(decoded: Option<&Value>) -> Option<(NetworkScope, String)> {
+    let socket_address = decoded?.get("socket_address")?;
+    let address = socket_address.get("address")?.as_str()?;
+    let port = socket_address.get("port")?.as_u64()?;
+    let address = address.parse::<IpAddr>().ok()?;
+    let scope = if address.is_loopback() {
+        NetworkScope::Loopback
+    } else {
+        NetworkScope::Unrestricted
+    };
+    Some((scope, format!("endpoint {address}:{port}")))
+}
+
+fn widen_network_fd(fd: i64, scope: NetworkScope, evidence: &mut Evidence) {
+    let current = evidence.network_fds.get(&fd).copied().unwrap_or_default();
+    evidence.network_fds.insert(fd, current.max(scope));
+    evidence.network_scope = evidence.network_scope.max(scope);
+}
+
+impl From<NetworkScope> for sandbox::Network {
+    fn from(scope: NetworkScope) -> Self {
+        match scope {
+            NetworkScope::None => Self::None,
+            NetworkScope::Loopback => Self::Loopback,
+            NetworkScope::Unrestricted => Self::Unrestricted,
         }
     }
 }
@@ -349,8 +500,10 @@ fn render_profile(
     function_name: &str,
     trace_files: &[PathBuf],
     evidence: &Evidence,
+    default_syscall_denials: &[String],
 ) -> String {
-    let generated_denials = generated_syscall_denials(evidence);
+    let generated_denials = generated_syscall_denials(default_syscall_denials, evidence);
+    let generated_network: sandbox::Network = evidence.network_scope.into();
     let mut source = String::new();
     writeln!(source, "// Copyright (c) Microsoft Corporation.").unwrap();
     writeln!(source, "// Licensed under the MIT License.\n").unwrap();
@@ -369,22 +522,17 @@ fn render_profile(
     write_comment_list(
         &mut source,
         "Observed syscalls",
-        evidence.syscalls.iter().cloned().chain(
-            evidence
-                .unknown_syscall_nrs
-                .iter()
-                .map(|nr| format!("unknown({nr})")),
-        ),
+        evidence.syscalls.iter().cloned(),
     );
     write_comment_list(
         &mut source,
-        "Default syscall denial list",
-        DEFAULT_SYSCALL_DENYLIST.map(str::to_string),
+        "Configured syscall denial list",
+        default_syscall_denials.iter().cloned(),
     );
     write_comment_list(
         &mut source,
         "Generated syscall denial list",
-        generated_denials.iter().map(|name| (*name).to_string()),
+        generated_denials.iter().cloned(),
     );
     write_comment_list(
         &mut source,
@@ -425,7 +573,7 @@ fn render_profile(
         )
         .unwrap();
     }
-    write!(source, "        .syscalls(Syscalls::Deny(&[").unwrap();
+    write!(source, "        .syscalls(Syscalls::deny([").unwrap();
     for (index, syscall) in generated_denials.iter().enumerate() {
         if index != 0 {
             write!(source, ", ").unwrap();
@@ -433,7 +581,12 @@ fn render_profile(
         write!(source, "{}", rust_string(syscall)).unwrap();
     }
     writeln!(source, "]))").unwrap();
-    writeln!(source, "        .network(Network::None)").unwrap();
+    writeln!(
+        source,
+        "        .network(Network::{})",
+        network_variant(generated_network)
+    )
+    .unwrap();
     writeln!(source, "}}").unwrap();
     source
 }
@@ -455,45 +608,19 @@ fn write_comment_list(
     }
 }
 
-fn generated_syscall_denials(evidence: &Evidence) -> Vec<&'static str> {
-    DEFAULT_SYSCALL_DENYLIST
-        .into_iter()
+fn generated_syscall_denials(
+    default_syscall_denials: &[String],
+    evidence: &Evidence,
+) -> Vec<String> {
+    default_syscall_denials
+        .iter()
         .filter(|name| !syscall_was_observed(name, evidence))
+        .cloned()
         .collect()
 }
 
 fn syscall_was_observed(name: &str, evidence: &Evidence) -> bool {
-    if evidence.syscalls.contains(name) {
-        return true;
-    }
-    default_syscall_nr(name).is_some_and(|nr| evidence.unknown_syscall_nrs.contains(&nr))
-}
-
-#[cfg(target_os = "linux")]
-fn default_syscall_nr(name: &str) -> Option<u64> {
-    match name {
-        "kill" => Some(libc::SYS_kill as u64),
-        "tkill" => Some(libc::SYS_tkill as u64),
-        "tgkill" => Some(libc::SYS_tgkill as u64),
-        _ => None,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn default_syscall_name(sys_nr: u64) -> Option<&'static str> {
-    DEFAULT_SYSCALL_DENYLIST
-        .into_iter()
-        .find(|name| default_syscall_nr(name) == Some(sys_nr))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn default_syscall_nr(_name: &str) -> Option<u64> {
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn default_syscall_name(_sys_nr: u64) -> Option<&'static str> {
-    None
+    evidence.syscalls.contains(name)
 }
 
 fn sanitize_file_component(worker: &str) -> String {
@@ -533,6 +660,14 @@ fn address_family_name(domain: u64) -> String {
     }
 }
 
+fn network_variant(network: sandbox::Network) -> &'static str {
+    match network {
+        sandbox::Network::None => "None",
+        sandbox::Network::Loopback => "Loopback",
+        sandbox::Network::Unrestricted => "Unrestricted",
+    }
+}
+
 fn rust_string(value: &str) -> String {
     format!("{value:?}")
 }
@@ -554,8 +689,16 @@ mod tests {
                 "\"decoded_args\":{\"path\":\"/usr/lib/libexample.so\"},\"result\":3}\n",
                 "{\"event\":\"syscall\",\"syscall\":\"socket\",\"sys_nr\":41,",
                 "\"args\":[2,1,0,0,0,0],\"decoded_args\":null,\"result\":4}\n",
+                "{\"event\":\"syscall\",\"syscall\":\"connect\",\"sys_nr\":42,",
+                "\"args\":[4,0,16,0,0,0],",
+                "\"decoded_args\":{\"socket_address\":{\"family\":\"AF_INET\",",
+                "\"address\":\"127.0.0.1\",\"port\":8080}},\"result\":0}\n",
                 "{\"event\":\"syscall\",\"syscall\":\"tgkill\",\"sys_nr\":234,",
                 "\"args\":[42,42,15,0,0,0],\"decoded_args\":null,\"result\":0}\n",
+                "{\"event\":\"syscall\",\"syscall\":\"read\",\"sys_nr\":0,",
+                "\"args\":[0,0,0,0,0,0],\"decoded_args\":null,\"result\":0}\n",
+                "{\"event\":\"syscall\",\"syscall\":\"unknown\",\"sys_nr\":999,",
+                "\"args\":[0,0,0,0,0,0],\"decoded_args\":null,\"result\":0}\n",
                 "{\"event\":\"task_exit\",\"pid\":42,\"tid\":42,\"exit_code\":0,\"signal\":null}\n"
             ),
         )
@@ -565,26 +708,48 @@ mod tests {
             trace_dir: traces,
             worker: "vm".to_string(),
             output_dir: temp.path().to_path_buf(),
+            syscall_denylist_path: None,
         })
         .unwrap();
 
+        assert_eq!(
+            report.syscall_denylist_path,
+            sandbox::platform_syscall_denylist_path().unwrap()
+        );
         assert_eq!(report.read_paths, vec![PathBuf::from("/usr/lib")]);
         assert_eq!(
             report.network_observations,
-            vec!["`socket` requested address family AF_INET."]
+            vec![
+                "`connect` used endpoint 127.0.0.1:8080.",
+                "`socket` requested address family AF_INET."
+            ]
         );
+        assert_eq!(report.generated_network, sandbox::Network::Loopback);
         let generated = fs_err::read_to_string(report.profile_path).unwrap();
         assert!(generated.contains(".read(\"/usr/lib\")"));
-        assert!(generated.contains(".network(Network::None)"));
+        assert!(generated.contains(".network(Network::Loopback)"));
         assert!(generated.contains("Observed syscalls"));
-        assert!(generated.contains("Default syscall denial list"));
+        assert!(generated.contains("Configured syscall denial list"));
         assert!(generated.contains("Generated syscall denial list"));
-        assert!(generated.contains("Syscalls::Deny(&[\"kill\", \"tkill\"])"));
+        assert!(generated.contains("Syscalls::deny(["));
         assert!(generated.contains(".name(\"vm_worker\")"));
+        assert!(!generated.contains("//! - read\n"));
+        assert!(!generated.contains("unknown(999)"));
         assert_eq!(
-            report.generated_syscall_denials,
-            vec!["kill".to_string(), "tkill".to_string()]
+            report.syscalls,
+            vec![
+                "connect".to_string(),
+                "openat".to_string(),
+                "socket".to_string(),
+                "tgkill".to_string()
+            ]
         );
+        let expected_denials = sandbox::load_platform_syscall_denylist()
+            .unwrap()
+            .into_iter()
+            .filter(|name| name != "tgkill")
+            .collect::<Vec<_>>();
+        assert_eq!(report.generated_syscall_denials, expected_denials);
     }
 
     #[test]
@@ -614,6 +779,72 @@ mod tests {
                 .filesystem_notes
                 .iter()
                 .any(|note| note.contains("implicit `/proc`"))
+        );
+    }
+
+    #[test]
+    fn generates_loopback_network_policy() {
+        let mut evidence = Evidence::default();
+        observe_network(
+            "socket",
+            [AF_INET, 1, 0, 0, 0, 0],
+            Some(4),
+            None,
+            None,
+            &mut evidence,
+        );
+        observe_network(
+            "connect",
+            [4, 0, 0, 0, 0, 0],
+            Some(0),
+            None,
+            Some(&serde_json::json!({
+                "socket_address": {
+                    "family": "AF_INET",
+                    "address": "127.0.0.1",
+                    "port": 8080
+                }
+            })),
+            &mut evidence,
+        );
+        observe_network(
+            "sendto",
+            [4, 0, 0, 0, 0, 0],
+            Some(12),
+            None,
+            None,
+            &mut evidence,
+        );
+
+        assert_eq!(evidence.network_scope, NetworkScope::Loopback);
+        assert_eq!(
+            sandbox::Network::from(evidence.network_scope),
+            sandbox::Network::Loopback
+        );
+    }
+
+    #[test]
+    fn generates_unrestricted_network_policy() {
+        let mut evidence = Evidence::default();
+        observe_network(
+            "connect",
+            [4, 0, 0, 0, 0, 0],
+            Some(0),
+            None,
+            Some(&serde_json::json!({
+                "socket_address": {
+                    "family": "AF_INET6",
+                    "address": "2001:db8::1",
+                    "port": 443
+                }
+            })),
+            &mut evidence,
+        );
+
+        assert_eq!(evidence.network_scope, NetworkScope::Unrestricted);
+        assert_eq!(
+            sandbox::Network::from(evidence.network_scope),
+            sandbox::Network::Unrestricted
         );
     }
 }

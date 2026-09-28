@@ -1,0 +1,6 @@
+{
+  "description": "Sample entry; replace or remove when the platform denylist is finalized.",
+  "denied_syscalls": [
+    "kill"
+  ]
+}

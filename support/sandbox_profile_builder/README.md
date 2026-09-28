@@ -1,16 +1,25 @@
 # Sandbox Profile Builder
 
-`sandbox_profile_builder` converts Linux OpenVMM worker syscall traces into a
-Rust sandbox profile template. The generated template is written beside the
-traces by default so feature teams can own and refine it independently from the
-predefined profiles in `support/sandbox/src/profiles`.
+Without this tool, developers must identify a worker's resource requirements
+and write its sandbox profile manually, which is tedious and error-prone.
+`sandbox_profile_builder` translates recorded worker behavior into a candidate
+profile by converting observed filesystem, network, and system call activity
+into the corresponding sandbox policy.
+
+Automatic profile generation has two steps. First, run OpenVMM with worker
+tracing enabled. OpenVMM runs VM-related work in separate Mesh worker
+processes, with each worker performing a specific function such as running a
+VM or emulating a device. The tracer records the files, network endpoints, and
+system calls used by the selected worker. Second, run
+`sandbox_profile_builder` against the trace to generate the candidate Rust
+sandbox profile.
 
 ## Build
 
-The tool is a default workspace member and is built with OpenVMM:
+Build the standalone profile-builder binary with:
 
 ```shell
-cargo build
+cargo build -p sandbox_profile_builder
 ```
 
 The executable is:
@@ -21,16 +30,18 @@ target/debug/sandbox_profile_builder
 
 ## Collect worker traces
 
-Worker tracing is available on Linux debug builds. Build OpenVMM, create a
-trace directory, disable the existing sandbox while collecting its required
-accesses, and launch OpenVMM with `--worker-trace-dir`:
+Worker tracing follows each separate Mesh worker with `ptrace`. It requires
+separate worker processes and is not available in single-process mode, where
+OpenVMM runs the control logic and all worker roles in one process.
+
+Create a directory for the traces and pass it to OpenVMM:
 
 ```shell
-mkdir -p /tmp/openvmm-worker-traces
+mkdir -p <TRACE_DIR>
 
 OPENVMM_SANDBOX_DISABLE=1 \
 target/debug/openvmm \
-    --worker-trace-dir /tmp/openvmm-worker-traces \
+    --worker-trace-dir <TRACE_DIR> \
     --processors 4 \
     --memory 2GB \
     --kernel /path/to/vmlinux \
@@ -39,61 +50,75 @@ target/debug/openvmm \
     --com1 console
 ```
 
-OpenVMM launches each separate Mesh worker under the in-process
-seccomp-assisted `ptrace` collector. Each worker produces one JSON Lines file:
+`OPENVMM_SANDBOX_DISABLE=1` disables sandbox application at runtime in debug
+builds so tracing can observe the resources required by an unrestricted
+worker. Release builds ignore this environment variable. Each worker writes
+one `.jsonl` trace file named:
 
 ```text
 worker-<worker-name>.<pid>.jsonl
 ```
 
 The seccomp filter reports only profile-relevant filesystem, network,
-file-descriptor tracking, and signal syscalls to ptrace. Other syscalls,
-including high-frequency virtualization operations, run without ptrace stops.
-Tracing is intended for profile development and is not supported with OpenVMM
-single-process mode.
+file-descriptor tracking, and signal system calls to `ptrace`. Other system
+calls execute normally without being intercepted, which reduces the
+performance impact on the worker.
 
 ## Generate a profile
 
-Pass the directory containing the traces and the worker name:
+Run the standalone profile-builder binary against the traces collected in the
+previous step:
 
 ```shell
-cargo run -p sandbox_profile_builder -- /tmp/openvmm-worker-traces vm
+target/debug/sandbox_profile_builder \
+    <TRACE_DIR> <WORKER> \
+    [--output-dir <OUTPUT_DIR>] \
+    [--syscall-denylist <PATH>]
 ```
 
-The default output is:
+`<TRACE_DIR>` is the directory created in the trace-collection step. The
+profile builder searches this directory and its subdirectories for matching
+trace files.
 
-```text
-/tmp/openvmm-worker-traces/vm_worker.rs
-```
+`<WORKER>` is the worker name from
+`worker-<worker-name>.<pid>.jsonl`.
 
-Use `--output-dir` to select another location:
+`--output-dir <OUTPUT_DIR>` is optional. Without it, the profile builder writes
+the generated profile to `<TRACE_DIR>/<WORKER>_worker.rs`.
 
-```shell
-cargo run -p sandbox_profile_builder -- \
-    /tmp/openvmm-worker-traces vm \
-    --output-dir /path/to/feature/source
-```
+`--syscall-denylist <PATH>` is optional. Without it, the profile builder uses
+the platform configuration selected by the `sandbox` crate.
 
-The tool recursively selects trace files matching the requested worker. It
-turns observed absolute file paths into directory grants because the sandbox
-bind-mounts granted directories at the same absolute paths. Read-like
-operations produce `.read(...)` grants, while observed write-like operations
-produce `.read_write(...)` grants. `/proc` and `/tmp` use the sandbox's
-implicit mounts and are reported under **Filesystem notes**.
+The generated profile is a starting point and must be reviewed before it is
+integrated into the worker.
 
-The generated source contains these evidence sections:
+#### Filesystem policy
 
-- **Observed syscalls**
-- **Default syscall denial list**
-- **Generated syscall denial list**
-- **Network observations**
-- **Filesystem notes**
+The profile builder uses the file accesses in the trace to determine which
+directories the worker needs to read or modify. Read access produces
+`.read(...)` entries, and write access produces `.read_write(...)` entries.
+`/proc` and `/tmp` are provided by the sandbox and are described in the
+generated profile's filesystem notes instead of being added as directory
+entries.
 
-The configurable default syscall denial list is `kill`, `tkill`, and `tgkill`.
-Any of those observed in the trace are removed from the generated list. The
-result is emitted through `Syscalls::Deny`. The sandbox implementation also
-applies its mandatory dangerous-syscall baseline whenever `Syscalls::Deny` is
-selected.
+#### Network policy
 
-Network activity is reported but does not automatically widen the profile;
-the generated template retains `Network::None`.
+The profile builder generates the narrowest network policy supported by the
+sandbox that covers the successful IP activity in the trace. It generates
+`Network::None` when no IP communication is observed, `Network::Loopback` when
+all observed endpoints are loopback addresses, and `Network::Unrestricted`
+when an external endpoint is observed or the destination cannot be determined.
+Because unrestricted networking retains the caller's network namespace, review
+that result before integrating the generated profile.
+
+#### System call policy
+
+The profile builder reads the platform system call denylist from the
+configuration file selected by the `sandbox` crate. It removes entries
+observed in the worker trace and writes the remaining denials to the generated
+profile.
+
+The sandbox also applies its built-in mandatory syscall restrictions whenever
+system call filtering is enabled. They are defined in
+`support/sandbox/src/unix/seccomp.rs` and are maintained by the sandbox
+implementation rather than duplicated here.

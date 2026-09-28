@@ -33,5 +33,5 @@ pub fn minimal() -> Builder {
         .read("/bin")
         .read("/lib")
         .network(Network::None)
-        .syscalls(Syscalls::Deny(&["kill", "tkill", "tgkill"]))
+        .syscalls(Syscalls::deny(std::iter::empty::<&str>()))
 }

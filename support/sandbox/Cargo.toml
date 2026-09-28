@@ -7,6 +7,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
 thiserror.workspace = true
 tracing.workspace = true
 
@@ -19,6 +21,9 @@ seccompiler.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 test_with_tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -93,7 +93,8 @@ pub fn apply(profile: &Profile) -> Result<(), Error> {
     // default (`Syscalls::Unfiltered`) installs no filter; an explicit
     // `Syscalls::Deny` installs the dangerous-syscall baseline plus any extras.
     if let Syscalls::Deny(names) = &p.syscalls {
-        seccomp::apply_denylist(names, seccomp_deny_action()).map_err(required("seccomp"))?;
+        let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+        seccomp::apply_denylist(&names, seccomp_deny_action()).map_err(required("seccomp"))?;
     }
 
     tracing::debug!(profile = p.name, "sandbox applied");

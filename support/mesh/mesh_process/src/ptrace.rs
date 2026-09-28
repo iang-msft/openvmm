@@ -21,6 +21,8 @@ use std::io::BufWriter;
 use std::io::Write;
 use std::mem::MaybeUninit;
 use std::mem::size_of;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::time::Instant;
@@ -31,10 +33,9 @@ const MAX_STRING_LEN: usize = 16 * 1024;
 const TRACE_BUFFER_CAPACITY: usize = 256 * 1024;
 
 pub fn seccomp_filter() -> io::Result<SeccompFilter> {
-    let rules = traced_syscall_nrs()
+    let rules = traced_syscalls()
         .iter()
-        .copied()
-        .map(|sys_nr| (sys_nr, Vec::new()))
+        .map(|&(sys_nr, _)| (sys_nr, Vec::new()))
         .collect::<BTreeMap<_, _>>();
     SeccompFilter::new(
         rules,
@@ -56,32 +57,34 @@ fn target_arch() -> TargetArch {
     }
 }
 
-fn traced_syscall_nrs() -> &'static [libc::c_long] {
+fn traced_syscalls() -> &'static [(libc::c_long, &'static str)] {
     &[
-        libc::SYS_openat,
-        libc::SYS_newfstatat,
-        libc::SYS_statx,
-        libc::SYS_readlinkat,
-        libc::SYS_faccessat,
-        libc::SYS_faccessat2,
-        libc::SYS_mkdirat,
-        libc::SYS_unlinkat,
-        libc::SYS_renameat2,
-        libc::SYS_dup,
-        libc::SYS_dup3,
-        libc::SYS_fcntl,
-        libc::SYS_close,
-        libc::SYS_socket,
-        libc::SYS_socketpair,
-        libc::SYS_bind,
-        libc::SYS_connect,
-        libc::SYS_listen,
-        libc::SYS_accept4,
-        libc::SYS_sendmsg,
-        libc::SYS_recvmsg,
-        libc::SYS_kill,
-        libc::SYS_tkill,
-        libc::SYS_tgkill,
+        (libc::SYS_openat, "openat"),
+        (libc::SYS_newfstatat, "newfstatat"),
+        (libc::SYS_statx, "statx"),
+        (libc::SYS_readlinkat, "readlinkat"),
+        (libc::SYS_faccessat, "faccessat"),
+        (libc::SYS_faccessat2, "faccessat2"),
+        (libc::SYS_mkdirat, "mkdirat"),
+        (libc::SYS_unlinkat, "unlinkat"),
+        (libc::SYS_renameat2, "renameat2"),
+        (libc::SYS_dup, "dup"),
+        (libc::SYS_dup3, "dup3"),
+        (libc::SYS_fcntl, "fcntl"),
+        (libc::SYS_close, "close"),
+        (libc::SYS_socket, "socket"),
+        (libc::SYS_socketpair, "socketpair"),
+        (libc::SYS_bind, "bind"),
+        (libc::SYS_connect, "connect"),
+        (libc::SYS_listen, "listen"),
+        (libc::SYS_accept4, "accept4"),
+        (libc::SYS_sendto, "sendto"),
+        (libc::SYS_recvfrom, "recvfrom"),
+        (libc::SYS_sendmsg, "sendmsg"),
+        (libc::SYS_recvmsg, "recvmsg"),
+        (libc::SYS_kill, "kill"),
+        (libc::SYS_tkill, "tkill"),
+        (libc::SYS_tgkill, "tgkill"),
     ]
 }
 
@@ -120,6 +123,7 @@ impl TracedChild {
 
 struct PendingSyscall {
     sys_nr: u64,
+    name: &'static str,
     args: [u64; 6],
     started: Instant,
     decoded_args: Value,
@@ -292,8 +296,14 @@ fn handle_seccomp_stop(tid: i32, pending: &mut Option<PendingSyscall>) -> io::Re
     // SAFETY: op identifies the active union member.
     let entry = unsafe { info.u.seccomp };
     let sys_nr = entry.nr;
+    let name = traced_syscall_name(sys_nr).ok_or_else(|| {
+        io::Error::other(format!(
+            "seccomp reported non-allowlisted syscall number {sys_nr}"
+        ))
+    })?;
     *pending = Some(PendingSyscall {
         sys_nr,
+        name,
         args: entry.args,
         started: Instant::now(),
         decoded_args: decode_args(tid, sys_nr, entry.args),
@@ -336,7 +346,7 @@ fn handle_syscall_exit(
             "timestamp_ns": unix_timestamp_ns(),
             "pid": root_pid,
             "tid": tid,
-            "syscall": syscall_name(entry.sys_nr),
+            "syscall": entry.name,
             "sys_nr": entry.sys_nr,
             "args": entry.args,
             "decoded_args": entry.decoded_args,
@@ -358,24 +368,88 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
         || sys_nr == libc::SYS_unlinkat as u64
     {
         Some(args[1])
-    } else if sys_nr == libc::SYS_execve as u64 {
-        Some(args[0])
     } else {
         None
     };
 
-    match path_address.and_then(|address| read_c_string(tid, address).ok()) {
-        Some(path) => json!({ "path": path }),
-        None => Value::Null,
+    if let Some(path) = path_address.and_then(|address| read_c_string(tid, address).ok()) {
+        return json!({ "path": path });
+    }
+
+    let socket_address = if sys_nr == libc::SYS_bind as u64 || sys_nr == libc::SYS_connect as u64 {
+        Some((args[1], args[2]))
+    } else if sys_nr == libc::SYS_sendto as u64 {
+        Some((args[4], args[5]))
+    } else {
+        None
+    };
+    if let Some((address, length)) = socket_address {
+        return decode_socket_address(tid, address, length).unwrap_or(Value::Null);
+    }
+
+    Value::Null
+}
+
+fn decode_socket_address(tid: i32, address: u64, length: u64) -> io::Result<Value> {
+    let length = usize::try_from(length)
+        .unwrap_or(usize::MAX)
+        .min(size_of::<libc::sockaddr_storage>());
+    let bytes = read_process_memory(tid, address, length)?;
+    parse_socket_address(&bytes)
+        .map(|(family, address, port)| {
+            json!({
+                "socket_address": {
+                    "family": family,
+                    "address": address,
+                    "port": port,
+                }
+            })
+        })
+        .ok_or_else(|| io::Error::other("unsupported or truncated socket address"))
+}
+
+fn parse_socket_address(bytes: &[u8]) -> Option<(&'static str, String, u16)> {
+    let family = u16::from_ne_bytes(bytes.get(..2)?.try_into().ok()?);
+    if family == libc::AF_INET as u16 {
+        let port = u16::from_be_bytes(bytes.get(2..4)?.try_into().ok()?);
+        let address = Ipv4Addr::new(
+            *bytes.get(4)?,
+            *bytes.get(5)?,
+            *bytes.get(6)?,
+            *bytes.get(7)?,
+        );
+        Some(("AF_INET", address.to_string(), port))
+    } else if family == libc::AF_INET6 as u16 {
+        let port = u16::from_be_bytes(bytes.get(2..4)?.try_into().ok()?);
+        let address = Ipv6Addr::from(<[u8; 16]>::try_from(bytes.get(8..24)?).ok()?);
+        Some(("AF_INET6", address.to_string(), port))
+    } else {
+        None
     }
 }
 
 fn read_c_string(tid: i32, address: u64) -> io::Result<String> {
+    let mut bytes = read_process_memory(tid, address, MAX_STRING_LEN)?;
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    bytes.truncate(end);
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn read_process_memory(tid: i32, address: u64, length: usize) -> io::Result<Vec<u8>> {
     if address == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "null address"));
     }
+    if length == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "zero-length read",
+        ));
+    }
 
-    let mut bytes = vec![0u8; MAX_STRING_LEN];
+    let mut bytes = vec![0u8; length];
     let local = libc::iovec {
         iov_base: bytes.as_mut_ptr().cast(),
         iov_len: bytes.len(),
@@ -388,56 +462,13 @@ fn read_c_string(tid: i32, address: u64) -> io::Result<String> {
     // by the kernel in the tracee's address space.
     let count = syscall_result(unsafe { libc::process_vm_readv(tid, &local, 1, &remote, 1, 0) })?;
     bytes.truncate(count as usize);
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    bytes.truncate(end);
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }
 
-fn syscall_name(sys_nr: u64) -> &'static str {
-    match sys_nr as i64 {
-        libc::SYS_read => "read",
-        libc::SYS_write => "write",
-        libc::SYS_close => "close",
-        libc::SYS_openat => "openat",
-        libc::SYS_newfstatat => "newfstatat",
-        libc::SYS_statx => "statx",
-        libc::SYS_readlinkat => "readlinkat",
-        libc::SYS_faccessat => "faccessat",
-        libc::SYS_faccessat2 => "faccessat2",
-        libc::SYS_mkdirat => "mkdirat",
-        libc::SYS_unlinkat => "unlinkat",
-        libc::SYS_renameat2 => "renameat2",
-        libc::SYS_dup => "dup",
-        libc::SYS_dup3 => "dup3",
-        libc::SYS_fcntl => "fcntl",
-        libc::SYS_socket => "socket",
-        libc::SYS_socketpair => "socketpair",
-        libc::SYS_bind => "bind",
-        libc::SYS_connect => "connect",
-        libc::SYS_listen => "listen",
-        libc::SYS_accept4 => "accept4",
-        libc::SYS_sendmsg => "sendmsg",
-        libc::SYS_recvmsg => "recvmsg",
-        libc::SYS_mmap => "mmap",
-        libc::SYS_mprotect => "mprotect",
-        libc::SYS_munmap => "munmap",
-        libc::SYS_clone => "clone",
-        libc::SYS_clone3 => "clone3",
-        libc::SYS_execve => "execve",
-        libc::SYS_exit => "exit",
-        libc::SYS_exit_group => "exit_group",
-        libc::SYS_kill => "kill",
-        libc::SYS_tkill => "tkill",
-        libc::SYS_tgkill => "tgkill",
-        libc::SYS_futex => "futex",
-        libc::SYS_ioctl => "ioctl",
-        libc::SYS_epoll_ctl => "epoll_ctl",
-        libc::SYS_epoll_pwait => "epoll_pwait",
-        _ => "unknown",
-    }
+fn traced_syscall_name(sys_nr: u64) -> Option<&'static str> {
+    traced_syscalls()
+        .iter()
+        .find_map(|&(number, name)| (number as u64 == sys_nr).then_some(name))
 }
 
 fn trace_options() -> libc::c_long {
@@ -532,6 +563,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_ipv4_socket_address() {
+        let mut bytes = [0u8; 8];
+        bytes[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        bytes[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        bytes[4..].copy_from_slice(&[127, 0, 0, 1]);
+
+        assert_eq!(
+            parse_socket_address(&bytes),
+            Some(("AF_INET", "127.0.0.1".to_string(), 8080))
+        );
+    }
+
+    #[test]
+    fn parses_ipv6_socket_address() {
+        let mut bytes = [0u8; 24];
+        bytes[..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
+        bytes[2..4].copy_from_slice(&443u16.to_be_bytes());
+        bytes[23] = 1;
+
+        assert_eq!(
+            parse_socket_address(&bytes),
+            Some(("AF_INET6", "::1".to_string(), 443))
+        );
+    }
+
+    #[test]
     fn traces_process_to_json_lines() {
         let dir = tempfile::tempdir().unwrap();
         let mut command = pal::unix::process::Builder::new("/usr/bin/true");
@@ -572,8 +629,10 @@ mod tests {
             events
                 .iter()
                 .filter(|event| event["event"] == "syscall")
-                .all(|event| traced_syscall_nrs()
-                    .contains(&(event["sys_nr"].as_i64().unwrap() as i64)))
+                .all(|event| {
+                    let sys_nr = event["sys_nr"].as_u64().unwrap();
+                    traced_syscall_name(sys_nr) == event["syscall"].as_str()
+                })
         );
         assert!(events.iter().any(|event| event["event"] == "task_exit"));
     }
