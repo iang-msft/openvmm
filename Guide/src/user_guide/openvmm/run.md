@@ -118,7 +118,7 @@ The kernel and initrd can be controlled via options:
 
 On Unix, OpenVMM can record the files and system calls used by each worker and
 automatically convert that trace into a candidate sandbox profile. See
-`support/sandbox_profile_builder/README.md` for setup and usage instructions.
+`support/sandbox_profiler/README.md` for setup and usage instructions.
 
 ### Windows, via UEFI
 

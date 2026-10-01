@@ -1,0 +1,24 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "pal_tracer"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fs-err.workspace = true
+futures.workspace = true
+libc.workspace = true
+pal.workspace = true
+seccompiler.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

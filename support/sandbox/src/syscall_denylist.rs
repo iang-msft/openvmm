@@ -4,9 +4,32 @@
 //! Platform-specific configurable syscall denials.
 
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
+
+/// Whether denying a syscall is required or workload-dependent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyscallDenylistClassification {
+    /// The syscall must remain denied.
+    Mandatory,
+    /// The syscall may be allowed when profiling demonstrates a workload need.
+    Optional,
+}
+
+/// One configured syscall denial.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyscallDenylistEntry {
+    /// Linux syscall name.
+    pub name: String,
+    /// Whether the denial is mandatory or optional.
+    pub classification: SyscallDenylistClassification,
+    /// Security rationale for denying the syscall.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
 
 /// An error encountered while loading a syscall denylist.
 #[derive(Debug, thiserror::Error)]
@@ -58,9 +81,7 @@ pub enum SyscallDenylistError {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SyscallDenylist {
-    #[serde(default, rename = "description")]
-    _description: Option<String>,
-    denied_syscalls: Vec<String>,
+    denied_syscalls: Vec<SyscallDenylistEntry>,
 }
 
 /// Return the source-tree configuration path for the current platform.
@@ -79,8 +100,10 @@ pub fn platform_syscall_denylist_path() -> Result<PathBuf, SyscallDenylistError>
     }
 }
 
-/// Load and validate syscall names from `path`.
-pub fn load_syscall_denylist(path: impl AsRef<Path>) -> Result<Vec<String>, SyscallDenylistError> {
+/// Load and validate syscall denial entries from `path`.
+pub fn load_syscall_denylist(
+    path: impl AsRef<Path>,
+) -> Result<Vec<SyscallDenylistEntry>, SyscallDenylistError> {
     let path = path.as_ref();
     let contents = std::fs::read_to_string(path).map_err(|source| SyscallDenylistError::Read {
         path: path.to_path_buf(),
@@ -91,28 +114,33 @@ pub fn load_syscall_denylist(path: impl AsRef<Path>) -> Result<Vec<String>, Sysc
             path: path.to_path_buf(),
             source,
         })?;
-    let mut names = BTreeSet::new();
-    for (index, name) in config.denied_syscalls.into_iter().enumerate() {
-        let name = name.trim();
+    let mut entries = BTreeMap::new();
+    for (index, mut entry) in config.denied_syscalls.into_iter().enumerate() {
+        let name = entry.name.trim().to_string();
         if name.is_empty() {
             return Err(SyscallDenylistError::EmptyName {
                 path: path.to_path_buf(),
                 index,
             });
         }
-        if !names.insert(name.to_string()) {
+        entry.name = name.clone();
+        entry.reason = entry
+            .reason
+            .map(|reason| reason.trim().to_string())
+            .filter(|reason| !reason.is_empty());
+        if entries.insert(entry.name.clone(), entry).is_some() {
             return Err(SyscallDenylistError::Duplicate {
                 path: path.to_path_buf(),
-                name: name.to_string(),
+                name,
             });
         }
     }
 
-    Ok(names.into_iter().collect())
+    Ok(entries.into_values().collect())
 }
 
 /// Load the syscall denylist selected for the current platform.
-pub fn load_platform_syscall_denylist() -> Result<Vec<String>, SyscallDenylistError> {
+pub fn load_platform_syscall_denylist() -> Result<Vec<SyscallDenylistEntry>, SyscallDenylistError> {
     load_syscall_denylist(platform_syscall_denylist_path()?)
 }
 
@@ -121,28 +149,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_sorted_syscall_names() {
+    fn loads_sorted_syscall_entries() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             temp.path(),
-            r#"{"denied_syscalls":["socket","accept4","bind"]}"#,
+            r#"{
+                "denied_syscalls": [
+                    {"name":"socket","classification":"mandatory","reason":" Network access. "},
+                    {"name":"accept4","classification":"optional"},
+                    {"name":"bind","classification":"mandatory","reason":""}
+                ]
+            }"#,
         )
         .unwrap();
 
         assert_eq!(
             load_syscall_denylist(temp.path()).unwrap(),
-            ["accept4", "bind", "socket"].map(str::to_string)
+            [
+                SyscallDenylistEntry {
+                    name: "accept4".to_string(),
+                    classification: SyscallDenylistClassification::Optional,
+                    reason: None,
+                },
+                SyscallDenylistEntry {
+                    name: "bind".to_string(),
+                    classification: SyscallDenylistClassification::Mandatory,
+                    reason: None,
+                },
+                SyscallDenylistEntry {
+                    name: "socket".to_string(),
+                    classification: SyscallDenylistClassification::Mandatory,
+                    reason: Some("Network access.".to_string()),
+                },
+            ]
         );
     }
 
     #[test]
     fn rejects_duplicate_syscall_names() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(temp.path(), r#"{"denied_syscalls":["socket","socket"]}"#).unwrap();
+        std::fs::write(
+            temp.path(),
+            r#"{
+                "denied_syscalls": [
+                    {"name":"socket","classification":"mandatory"},
+                    {"name":"socket","classification":"optional"}
+                ]
+            }"#,
+        )
+        .unwrap();
 
         assert!(matches!(
             load_syscall_denylist(temp.path()),
             Err(SyscallDenylistError::Duplicate { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_classification() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            temp.path(),
+            r#"{
+                "denied_syscalls": [
+                    {"name":"socket","classification":"recommended"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load_syscall_denylist(temp.path()),
+            Err(SyscallDenylistError::Parse { .. })
         ));
     }
 }

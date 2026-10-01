@@ -8,14 +8,14 @@ use anyhow::Context;
 use inspect::Inspect;
 use mesh_process::Mesh;
 use mesh_process::ProcessConfig;
-#[cfg(target_os = "linux")]
-use mesh_process::ProcessTraceConfig;
 use mesh_process::try_run_mesh_host;
 use mesh_worker::RegisteredWorkers;
 use mesh_worker::WorkerHost;
 use openvmm_defs::entrypoint::MeshHostParams;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
+#[cfg(target_os = "linux")]
+use pal_tracer::TraceConfig;
 use std::path::PathBuf;
 
 pub(crate) fn run_vmm_mesh_host() -> anyhow::Result<()> {
@@ -35,7 +35,7 @@ pub(crate) struct VmmMesh {
     _task: Task<()>,
     #[cfg(target_os = "linux")]
     #[inspect(skip)]
-    worker_trace_dir: Option<PathBuf>,
+    worker_trace: Option<TraceConfig>,
 }
 
 impl VmmMesh {
@@ -56,12 +56,25 @@ impl VmmMesh {
         };
         let (local_host, runner) = mesh_worker::worker_host();
         let task = spawn.spawn("worker-host", runner.run(RegisteredWorkers));
+        #[cfg(target_os = "linux")]
+        let worker_trace = worker_trace_dir
+            .map(|output_dir| {
+                let deny_syscalls = sandbox::load_platform_syscall_denylist()
+                    .context("failed to load worker trace syscall denylist")?
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect::<Vec<_>>();
+                let syscalls =
+                    pal_tracer::resolve_trace_syscalls(&deny_syscalls, sandbox::nr_for_name)?;
+                Ok::<_, anyhow::Error>(TraceConfig::new(output_dir, "worker", syscalls))
+            })
+            .transpose()?;
         Ok(Self {
             mesh,
             local_host,
             _task: task,
             #[cfg(target_os = "linux")]
-            worker_trace_dir,
+            worker_trace,
         })
     }
 
@@ -84,10 +97,8 @@ impl VmmMesh {
             let (host, runner) = mesh_worker::worker_host();
             let config = ProcessConfig::new(name.clone()).stderr(log_file);
             #[cfg(target_os = "linux")]
-            let config = if let Some(output_dir) = &self.worker_trace_dir {
-                config.trace(ProcessTraceConfig {
-                    output_dir: output_dir.clone(),
-                })
+            let config = if let Some(trace) = &self.worker_trace {
+                config.trace(trace.clone())
             } else {
                 config
             };

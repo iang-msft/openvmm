@@ -5,7 +5,7 @@
 resolver = "2"
 default-members = [
   "openvmm/openvmm",
-  "support/sandbox_profile_builder",
+  "support/sandbox_profiler",
 ]
 members = [
   # openvmm
@@ -57,7 +57,7 @@ members = [
   "petri/make_imc_hive",
   "petri/petri-tool",
   "support/sandbox_test_launcher",
-  "support/sandbox_profile_builder",
+  "support/sandbox_profiler",
   "vm/devices/get/test_igvm_agent_rpc_server",
   "vm/devices/tpm/tpm_guest_tests",
   "vm/loader/igvmfilegen",
@@ -166,6 +166,7 @@ mesh_remote = { path = "support/mesh/mesh_remote" }
 mesh_rpc = { path = "support/mesh/mesh_rpc" }
 mesh_tracing = { path = "support/mesh_tracing" }
 mesh_worker = { path = "support/mesh/mesh_worker" }
+pal_tracer = { path = "support/pal/pal_tracer" }
 minircu = { path = "support/minircu" }
 nostd_spin_channel = { path = "support/nostd_spin_channel"}
 open_enum = { path = "support/open_enum" }

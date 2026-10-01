@@ -243,6 +243,7 @@ fn survival_syscall_nrs() -> [i64; 4] {
 /// (`openat` not `open`, `ppoll` not `poll`, `dup3` not `dup2`, `newfstatat`
 /// not `stat`). Legacy aliases can be added behind an architecture `cfg` when a
 /// worker genuinely needs them.
+#[allow(deprecated)]
 pub fn nr_for_name(name: &str) -> Option<i64> {
     let nr = match name {
         // Process lifecycle
@@ -276,12 +277,18 @@ pub fn nr_for_name(name: &str) -> Option<i64> {
         "openat" => libc::SYS_openat,
         "fstat" => libc::SYS_fstat,
         "newfstatat" => libc::SYS_newfstatat,
+        "statx" => libc::SYS_statx,
         "lseek" => libc::SYS_lseek,
         "ioctl" => libc::SYS_ioctl,
         "fcntl" => libc::SYS_fcntl,
         "dup" => libc::SYS_dup,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "dup2" => libc::SYS_dup2,
         "dup3" => libc::SYS_dup3,
         "pipe2" => libc::SYS_pipe2,
+        "mkdirat" => libc::SYS_mkdirat,
+        "unlinkat" => libc::SYS_unlinkat,
+        "renameat2" => libc::SYS_renameat2,
         // Event polling
         "epoll_create1" => libc::SYS_epoll_create1,
         "epoll_ctl" => libc::SYS_epoll_ctl,
@@ -322,6 +329,7 @@ pub fn nr_for_name(name: &str) -> Option<i64> {
         "prctl" => libc::SYS_prctl,
         // Network
         "socket" => libc::SYS_socket,
+        "socketpair" => libc::SYS_socketpair,
         "connect" => libc::SYS_connect,
         "bind" => libc::SYS_bind,
         "listen" => libc::SYS_listen,
@@ -335,6 +343,49 @@ pub fn nr_for_name(name: &str) -> Option<i64> {
         "shutdown" => libc::SYS_shutdown,
         "setsockopt" => libc::SYS_setsockopt,
         "getsockopt" => libc::SYS_getsockopt,
+        // Configurable sandbox denylist
+        "acct" => libc::SYS_acct,
+        "add_key" => libc::SYS_add_key,
+        "bpf" => libc::SYS_bpf,
+        "chroot" => libc::SYS_chroot,
+        "clone3" => libc::SYS_clone3,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "create_module" => libc::SYS_create_module,
+        "delete_module" => libc::SYS_delete_module,
+        "finit_module" => libc::SYS_finit_module,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "fork" => libc::SYS_fork,
+        "fsconfig" => libc::SYS_fsconfig,
+        "fsmount" => libc::SYS_fsmount,
+        "fsopen" => libc::SYS_fsopen,
+        "fspick" => libc::SYS_fspick,
+        "init_module" => libc::SYS_init_module,
+        "io_uring_enter" => libc::SYS_io_uring_enter,
+        "io_uring_register" => libc::SYS_io_uring_register,
+        "io_uring_setup" => libc::SYS_io_uring_setup,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "ioperm" => libc::SYS_ioperm,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "iopl" => libc::SYS_iopl,
+        "kcmp" => libc::SYS_kcmp,
+        "kexec_file_load" => libc::SYS_kexec_file_load,
+        "kexec_load" => libc::SYS_kexec_load,
+        "keyctl" => libc::SYS_keyctl,
+        "mount" => libc::SYS_mount,
+        "mount_setattr" => libc::SYS_mount_setattr,
+        "move_mount" => libc::SYS_move_mount,
+        "open_tree" => libc::SYS_open_tree,
+        "pivot_root" => libc::SYS_pivot_root,
+        "process_vm_readv" => libc::SYS_process_vm_readv,
+        "process_vm_writev" => libc::SYS_process_vm_writev,
+        "ptrace" => libc::SYS_ptrace,
+        "reboot" => libc::SYS_reboot,
+        "request_key" => libc::SYS_request_key,
+        "setns" => libc::SYS_setns,
+        "umount2" => libc::SYS_umount2,
+        "unshare" => libc::SYS_unshare,
+        "userfaultfd" => libc::SYS_userfaultfd,
+        "waitid" => libc::SYS_waitid,
         // Architecture-specific: `arch_prctl` is x86-only.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         "arch_prctl" => libc::SYS_arch_prctl,

@@ -14,7 +14,10 @@ use sandbox::Syscalls;
 use sandbox::profiles;
 
 fn main() -> anyhow::Result<()> {
-    let syscall_denials = sandbox::load_platform_syscall_denylist()?;
+    let syscall_denials = sandbox::load_platform_syscall_denylist()?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
     let profile = profiles::minimal()
         .name("sandbox_test_launcher")
         .syscalls(Syscalls::deny(syscall_denials))

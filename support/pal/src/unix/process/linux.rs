@@ -82,6 +82,9 @@ impl Builder<'_> {
         // Use CLONE_PIDFD to get an fd back to use for polling.
         let mut flags = self.linux_builder.clone_flags | libc::CLONE_PIDFD | libc::SIGCHLD;
 
+        // Tracing stops the child before exec so the parent can attach ptrace.
+        // Using vfork would deadlock: the parent waits for exec while the child
+        // waits for the parent to resume it.
         let using_vfork =
             self.linux_builder.vfork && self.linux_builder.trace_seccomp_filter.is_none();
         if using_vfork {
@@ -316,9 +319,10 @@ extern "C" fn clone_cb(context: *mut libc::c_void) -> libc::c_int {
     set_capabilities!(caps::CapSet::Inheritable, inheritable_capabilities);
     set_capabilities!(caps::CapSet::Effective, effective_capabilities);
 
+    // Stop before installing the tracing filter and executing the worker so the
+    // parent can attach ptrace and capture syscalls from the start of execution.
     if context.trace_seccomp_filter.is_some() {
-        // SAFETY: raise has no memory-safety requirements. The parent requested
-        // this stop and disabled vfork so it can attach a ptrace supervisor.
+        // SAFETY: raise has no memory-safety requirements.
         if unsafe { libc::raise(libc::SIGSTOP) } < 0 {
             return errno().0;
         }

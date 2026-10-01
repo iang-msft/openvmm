@@ -63,9 +63,6 @@ use tracing::Instrument;
 use tracing::instrument;
 use unicycle::FuturesUnordered;
 
-#[cfg(target_os = "linux")]
-mod ptrace;
-
 #[cfg(windows)]
 mod plat {
     pub type IpcNode = mesh_remote::windows::AlpcNode;
@@ -78,6 +75,7 @@ mod plat {
     pub type IpcNodeDriver = pal_async::DefaultDriver;
 }
 
+use pal_tracer::TraceConfig;
 use plat::IpcNode;
 use plat::IpcNodeDriver;
 
@@ -308,14 +306,7 @@ pub struct ProcessConfig {
     skip_worker_arg: bool,
     sandbox_profile: Option<Box<dyn SandboxProfile + Sync>>,
     env_vars: Vec<(OsString, OsString)>,
-    trace: Option<ProcessTraceConfig>,
-}
-
-/// Linux worker syscall-tracing configuration.
-#[derive(Debug, Clone)]
-pub struct ProcessTraceConfig {
-    /// Directory in which the per-worker JSONL trace is written.
-    pub output_dir: PathBuf,
+    trace_config: Option<TraceConfig>,
 }
 
 impl ProcessConfig {
@@ -330,7 +321,7 @@ impl ProcessConfig {
             skip_worker_arg: false,
             sandbox_profile: None,
             env_vars: Vec::new(),
-            trace: None,
+            trace_config: None,
         }
     }
 
@@ -348,7 +339,7 @@ impl ProcessConfig {
             skip_worker_arg: false,
             sandbox_profile: Some(sandbox_profile),
             env_vars: Vec::new(),
-            trace: None,
+            trace_config: None,
         }
     }
 
@@ -396,8 +387,8 @@ impl ProcessConfig {
     }
 
     /// Enables structured syscall tracing for this process on Linux.
-    pub fn trace(mut self, trace: ProcessTraceConfig) -> Self {
-        self.trace = Some(trace);
+    pub fn trace(mut self, trace_config: TraceConfig) -> Self {
+        self.trace_config = Some(trace_config);
         self
     }
 }
@@ -406,7 +397,7 @@ impl ProcessConfig {
 enum UnixMeshChild {
     Normal(pal_async::process::PolledChild<pal::unix::process::Child>),
     #[cfg(target_os = "linux")]
-    Traced(ptrace::TracedChild),
+    Traced(pal_tracer::TracedChild),
 }
 
 struct MeshInner {
@@ -964,9 +955,10 @@ impl MeshInner {
             }
 
             #[cfg(target_os = "linux")]
-            if config.trace.is_some() {
+            if let Some(trace_config) = config.trace_config.as_ref() {
                 command.set_trace_seccomp_filter(
-                    ptrace::seccomp_filter().context("failed to build worker trace filter")?,
+                    pal_tracer::build_seccomp_filter(trace_config)
+                        .context("failed to build worker trace filter")?,
                 );
             }
 
@@ -982,9 +974,9 @@ impl MeshInner {
             tracing::Span::current().record("pid", pid);
 
             #[cfg(target_os = "linux")]
-            if let Some(trace) = config.trace {
+            if let Some(trace_config) = config.trace_config {
                 UnixMeshChild::Traced(
-                    ptrace::TracedChild::start(child, &name, trace)
+                    pal_tracer::TracedChild::start(child, &name, trace_config)
                         .context("failed to start worker tracer")?,
                 )
             } else {
@@ -1000,7 +992,7 @@ impl MeshInner {
             #[cfg(not(target_os = "linux"))]
             {
                 anyhow::ensure!(
-                    config.trace.is_none(),
+                    config.trace_config.is_none(),
                     "worker syscall tracing is supported only on Linux"
                 );
                 UnixMeshChild::Normal(

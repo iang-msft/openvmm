@@ -53,11 +53,12 @@ fn vtpm_profile() -> Profile {
 
 `Syscalls::deny` installs a curated **default-allow** seccomp filter: it always
 blocks the built-in dangerous-syscall baseline (namespace-escape and kernel-CVE
-vectors such as `mount`, `unshare`, `pivot_root`, `bpf` — see
-[`docs/seccomp-denylist.md`](docs/seccomp-denylist.md)) plus any extra names you
-list, and allows everything else. A worker's full set of *needed* syscalls can't
-be reliably enumerated, so the filter denies what a sandboxed worker never
-legitimately needs rather than trying to allowlist what it does.
+vectors such as `mount`, `unshare`, `pivot_root`, and `bpf`, documented in
+[`src/unix/syscall_denylist.json`](src/unix/syscall_denylist.json)) plus any
+extra names you list, and allows everything else. A worker's full set of
+*needed* syscalls can't be reliably enumerated, so the filter denies what a
+sandboxed worker never legitimately needs rather than trying to allowlist what
+it does.
 
 The standalone launcher loads its additional syscall denials from the
 platform configuration returned by `sandbox::platform_syscall_denylist_path`.

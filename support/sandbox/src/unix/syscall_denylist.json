@@ -1,6 +1,206 @@
 {
-  "description": "Sample entry; replace or remove when the platform denylist is finalized.",
   "denied_syscalls": [
-    "kill"
+    {
+      "name": "acct",
+      "classification": "optional",
+      "reason": "Requires CAP_SYS_PACCT."
+    },
+    {
+      "name": "add_key",
+      "classification": "optional",
+      "reason": "Accepts attacker-controlled variable-size payloads."
+    },
+    {
+      "name": "bpf",
+      "classification": "mandatory",
+      "reason": "Loads eBPF programs and maps, exposing a historically CVE-rich privilege-escalation and information-leak surface."
+    },
+    {
+      "name": "chroot",
+      "classification": "mandatory",
+      "reason": "Facilitates sandbox escape."
+    },
+    {
+      "name": "clone3",
+      "classification": "mandatory",
+      "reason": "Can hide CLONE_NEW namespace flags behind a pointer that seccomp cannot inspect."
+    },
+    {
+      "name": "create_module",
+      "classification": "mandatory",
+      "reason": "Creates kernel module memory, enabling arbitrary kernel-code execution."
+    },
+    {
+      "name": "delete_module",
+      "classification": "mandatory",
+      "reason": "Can remove security modules or trigger module-unload races."
+    },
+    {
+      "name": "execve",
+      "classification": "mandatory"
+    },
+    {
+      "name": "finit_module",
+      "classification": "mandatory",
+      "reason": "Loads a kernel module, enabling arbitrary kernel-code execution."
+    },
+    {
+      "name": "fork",
+      "classification": "mandatory"
+    },
+    {
+      "name": "fsconfig",
+      "classification": "mandatory",
+      "reason": "Configures new mount API filesystem contexts with power equivalent to mount."
+    },
+    {
+      "name": "fsmount",
+      "classification": "mandatory",
+      "reason": "Creates mounts through the new mount API, bypassing a mount-only denial."
+    },
+    {
+      "name": "fsopen",
+      "classification": "mandatory",
+      "reason": "Creates filesystem contexts for the new mount API, bypassing a mount-only denial."
+    },
+    {
+      "name": "fspick",
+      "classification": "mandatory",
+      "reason": "Selects existing mounts for reconfiguration through the new mount API."
+    },
+    {
+      "name": "init_module",
+      "classification": "mandatory",
+      "reason": "Loads a kernel module, enabling arbitrary kernel-code execution."
+    },
+    {
+      "name": "io_uring_enter",
+      "classification": "mandatory",
+      "reason": "Executes io_uring operations that can bypass syscall-level file and network filtering."
+    },
+    {
+      "name": "io_uring_register",
+      "classification": "mandatory",
+      "reason": "Registers io_uring resources through a young, historically CVE-rich kernel subsystem."
+    },
+    {
+      "name": "io_uring_setup",
+      "classification": "mandatory",
+      "reason": "Creates io_uring instances that expose a young, historically CVE-rich kernel subsystem."
+    },
+    {
+      "name": "ioperm",
+      "classification": "mandatory",
+      "reason": "Grants direct x86 I/O-port access that bypasses normal kernel device mediation."
+    },
+    {
+      "name": "iopl",
+      "classification": "mandatory",
+      "reason": "Raises x86 I/O privilege, allowing direct hardware access outside normal kernel mediation."
+    },
+    {
+      "name": "kcmp",
+      "classification": "optional",
+      "reason": "Compares kernel resources across processes and can leak information about shared resources."
+    },
+    {
+      "name": "kexec_file_load",
+      "classification": "mandatory",
+      "reason": "Loads a replacement kernel image, enabling complete host takeover."
+    },
+    {
+      "name": "kexec_load",
+      "classification": "mandatory",
+      "reason": "Loads a replacement kernel image, enabling complete host takeover."
+    },
+    {
+      "name": "keyctl",
+      "classification": "optional",
+      "reason": "Accepts attacker-controlled variable-size payloads."
+    },
+    {
+      "name": "madvise",
+      "classification": "optional",
+      "reason": "Can help trigger race conditions."
+    },
+    {
+      "name": "mount",
+      "classification": "mandatory",
+      "reason": "Can remount host filesystems or strip protection flags, defeating filesystem confinement."
+    },
+    {
+      "name": "mount_setattr",
+      "classification": "mandatory",
+      "reason": "Can clear read-only, nosuid, or nodev attributes from sandbox mounts."
+    },
+    {
+      "name": "move_mount",
+      "classification": "mandatory",
+      "reason": "Relocates mounts through the new mount API and exposes the same escape surface as mount."
+    },
+    {
+      "name": "open_tree",
+      "classification": "mandatory",
+      "reason": "Clones mount trees into file descriptors that can be detached and reattached."
+    },
+    {
+      "name": "pivot_root",
+      "classification": "mandatory",
+      "reason": "Repoints the process root filesystem and can undo the sandbox root boundary."
+    },
+    {
+      "name": "process_vm_readv",
+      "classification": "mandatory",
+      "reason": "Reads another process's address space directly, enabling secret theft."
+    },
+    {
+      "name": "process_vm_writev",
+      "classification": "mandatory",
+      "reason": "Writes another process's address space directly, enabling code injection."
+    },
+    {
+      "name": "ptrace",
+      "classification": "mandatory",
+      "reason": "Controls other processes and can read or modify their memory and registers."
+    },
+    {
+      "name": "reboot",
+      "classification": "mandatory",
+      "reason": "Can reboot or halt the host, causing whole-machine denial of service."
+    },
+    {
+      "name": "request_key",
+      "classification": "optional",
+      "reason": "Accesses kernel keyring management, a historically UAF- and refcount-bug-prone surface."
+    },
+    {
+      "name": "setns",
+      "classification": "mandatory",
+      "reason": "Joins an existing namespace and could re-enter host mount, network, or PID namespaces."
+    },
+    {
+      "name": "umount",
+      "classification": "mandatory",
+      "reason": "Can detach protective mounts and expose underlying host filesystem content."
+    },
+    {
+      "name": "umount2",
+      "classification": "mandatory",
+      "reason": "Can detach protective mounts and expose underlying host filesystem content."
+    },
+    {
+      "name": "unshare",
+      "classification": "mandatory",
+      "reason": "Creates new namespaces, including user namespaces that grant capabilities within the new namespace."
+    },
+    {
+      "name": "userfaultfd",
+      "classification": "mandatory",
+      "reason": "Provides userspace page-fault handling used to widen race windows and groom kernel memory."
+    },
+    {
+      "name": "waitid",
+      "classification": "mandatory"
+    }
   ]
 }

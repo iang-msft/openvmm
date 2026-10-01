@@ -1,8 +1,8 @@
-# Sandbox Profile Builder
+# Sandbox Profiler
 
 Without this tool, developers must identify a worker's resource requirements
 and write its sandbox profile manually, which is tedious and error-prone.
-`sandbox_profile_builder` translates recorded worker behavior into a candidate
+`sandbox_profiler` translates recorded worker behavior into a candidate
 profile by converting observed filesystem, network, and system call activity
 into the corresponding sandbox policy.
 
@@ -11,7 +11,7 @@ tracing enabled. OpenVMM runs VM-related work in separate Mesh worker
 processes, with each worker performing a specific function such as running a
 VM or emulating a device. The tracer records the files, network endpoints, and
 system calls used by the selected worker. Second, run
-`sandbox_profile_builder` against the trace to generate the candidate Rust
+`sandbox_profiler` against the trace to generate the candidate Rust
 sandbox profile.
 
 ## Build
@@ -19,13 +19,13 @@ sandbox profile.
 Build the standalone profile-builder binary with:
 
 ```shell
-cargo build -p sandbox_profile_builder
+cargo build -p sandbox_profiler
 ```
 
 The executable is:
 
 ```text
-target/debug/sandbox_profile_builder
+target/debug/sandbox_profiler
 ```
 
 ## Collect worker traces
@@ -59,10 +59,12 @@ one `.jsonl` trace file named:
 worker-<worker-name>.<pid>.jsonl
 ```
 
-The seccomp filter reports only profile-relevant filesystem, network,
-file-descriptor tracking, and signal system calls to `ptrace`. Other system
-calls execute normally without being intercepted, which reduces the
-performance impact on the worker.
+The seccomp filter reports only profile-relevant filesystem, network, and
+file-descriptor tracking system calls, plus the system calls in the platform
+denylist, to `ptrace`. Other system calls execute normally without being
+intercepted, which reduces the performance impact on the worker. OpenVMM
+validates every configured denial before launching a traced worker and stops
+with an error if tracing support for a configured name is missing.
 
 ## Generate a profile
 
@@ -70,7 +72,7 @@ Run the standalone profile-builder binary against the traces collected in the
 previous step:
 
 ```shell
-target/debug/sandbox_profile_builder \
+target/debug/sandbox_profiler \
     <TRACE_DIR> <WORKER> \
     [--output-dir <OUTPUT_DIR>] \
     [--syscall-denylist <PATH>]
@@ -116,7 +118,8 @@ that result before integrating the generated profile.
 The profile builder reads the platform system call denylist from the
 configuration file selected by the `sandbox` crate. It removes entries
 observed in the worker trace and writes the remaining denials to the generated
-profile.
+profile. It validates the configured names before reading the trace files and
+stops with an error if tracing support for a configured name is missing.
 
 The sandbox also applies its built-in mandatory syscall restrictions whenever
 system call filtering is enabled. They are defined in

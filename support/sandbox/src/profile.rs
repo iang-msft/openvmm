@@ -164,9 +164,10 @@ impl Builder {
 }
 
 /// Network reachability granted to the worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Network {
     /// No network at all — an empty network namespace with no peer.
+    #[default]
     None,
     /// Loopback only (`127.0.0.0/8`, `::1`) — a network namespace with the
     /// loopback interface brought up and nothing else.
