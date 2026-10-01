@@ -18,11 +18,40 @@ use pal_async::task::Task;
 use pal_tracer::TraceConfig;
 use std::path::PathBuf;
 
+use crate::sandbox_profiles::SandboxRole;
+
+const SANDBOX_ROLE_ARG: &str = "--openvmm-sandbox-role=";
+
 pub(crate) fn run_vmm_mesh_host() -> anyhow::Result<()> {
     try_run_mesh_host("openvmm", async |params: MeshHostParams| {
         params.runner.run(RegisteredWorkers).await;
         Ok(())
     })
+}
+
+pub(crate) fn apply_vmm_mesh_host_sandbox() -> anyhow::Result<()> {
+    if let Some(role) = sandbox_role_from_args()? {
+        sandbox::apply(&role.profile()).context("failed to apply worker host sandbox")?;
+    }
+    Ok(())
+}
+
+fn sandbox_role_from_args() -> anyhow::Result<Option<SandboxRole>> {
+    let mut role = None;
+    for arg in std::env::args() {
+        let Some(value) = arg.strip_prefix(SANDBOX_ROLE_ARG) else {
+            continue;
+        };
+        let parsed = match value {
+            "vm" => SandboxRole::Vm,
+            "tpm" => SandboxRole::Tpm,
+            _ => anyhow::bail!("unknown OpenVMM sandbox role `{value}`"),
+        };
+        if role.replace(parsed).is_some() {
+            anyhow::bail!("OpenVMM sandbox role specified more than once");
+        }
+    }
+    Ok(role)
 }
 
 #[derive(Inspect)]
@@ -83,6 +112,29 @@ impl VmmMesh {
         name: impl Into<String>,
         log_file: Option<PathBuf>,
     ) -> anyhow::Result<WorkerHost> {
+        self.make_host_inner(name.into(), log_file, None).await
+    }
+
+    pub async fn make_sandboxed_host(
+        &self,
+        role: SandboxRole,
+        log_file: Option<PathBuf>,
+    ) -> anyhow::Result<WorkerHost> {
+        self.make_host_inner(role.name().to_string(), log_file, Some(role))
+            .await
+    }
+
+    async fn make_host_inner(
+        &self,
+        name: String,
+        log_file: Option<PathBuf>,
+        sandbox_role: Option<SandboxRole>,
+    ) -> anyhow::Result<WorkerHost> {
+        #[cfg(not(target_os = "linux"))]
+        if sandbox_role.is_some() {
+            return Err(sandbox::Error::UnsupportedPlatform.into());
+        }
+
         let log_file: Option<std::fs::File> = if let Some(file) = &log_file {
             Some(
                 std::fs::File::create(file)
@@ -95,14 +147,17 @@ impl VmmMesh {
         let name = name.into();
         let host = if let Some(mesh) = &self.mesh {
             let (host, runner) = mesh_worker::worker_host();
-            let config = ProcessConfig::new(name.clone()).stderr(log_file);
             #[cfg(target_os = "linux")]
-            let config = if let Some(trace) = &self.worker_trace {
-                config.trace(trace.clone())
-            } else {
-                config
+            let process_config = match sandbox_role {
+                Some(role) => ProcessConfig::new_with_sandbox(role.name(), role.profile())
+                    .args([format!("{SANDBOX_ROLE_ARG}{}", role.name())])
+                    .stderr(log_file),
+                None => ProcessConfig::new(name).stderr(log_file),
             };
-            mesh.launch_host(config, MeshHostParams { runner }).await?;
+            #[cfg(not(target_os = "linux"))]
+            let process_config = ProcessConfig::new(name).stderr(log_file);
+            mesh.launch_host(process_config, MeshHostParams { runner })
+                .await?;
             host
         } else {
             self.local_host.clone()

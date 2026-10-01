@@ -13,6 +13,7 @@ mod kvp;
 mod meshworker;
 mod pidfile;
 mod repl;
+mod sandbox_profiles;
 mod serial_io;
 mod storage_builder;
 mod tracing_init;
@@ -101,6 +102,7 @@ use pal_async::DefaultPool;
 use pal_async::socket::PolledSocket;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
+use sandbox_profiles::SandboxRole;
 use serial_16550_resources::ComPort;
 use serial_core::resources::DisconnectedSerialBackendHandle;
 use sparse_mmap::alloc_shared_memory;
@@ -158,7 +160,11 @@ pub fn openvmm_main() {
         Ok(code) => code,
         Err(err) => {
             eprintln!("fatal error: {:?}", err);
-            1
+            if err.downcast_ref::<sandbox::Error>().is_some() {
+                sandbox::EXIT_SANDBOX_FAILED
+            } else {
+                1
+            }
         }
     };
 
@@ -1328,6 +1334,11 @@ async fn vm_config_from_command_line(
         .build()
         .context("failed to build chipset configuration")?;
 
+    let tpm_version = opt.tpm.map(|cli_ver| match cli_ver {
+        TpmVersionCli::V138 => TpmVersion::V138,
+        TpmVersionCli::V185 => TpmVersion::V185,
+    });
+
     if opt.restore_snapshot.is_some() {
         // Snapshot restore: skip firmware loading entirely. Device state and
         // memory come from the snapshot directory.
@@ -1407,7 +1418,7 @@ async fn vm_config_from_command_line(
             enable_debugging: opt.uefi_debug,
             enable_memory_protections: opt.uefi_enable_memory_protections,
             disable_frontpage: opt.disable_frontpage,
-            enable_tpm: opt.tpm.is_some(),
+            tpm_version,
             enable_battery: opt.battery,
             enable_serial: any_serial_configured,
             enable_vpci_boot: false,
@@ -1571,9 +1582,9 @@ async fn vm_config_from_command_line(
                         .vtl2_gfx
                         .then(|| SharedFramebufferHandle.into_resource()),
                     guest_request_recv,
-                    tpm_version: opt.tpm.map(|v| match v {
-                        TpmVersionCli::V138 => get_resources::ged::GedTpmVersion::V138,
-                        TpmVersionCli::V185 => get_resources::ged::GedTpmVersion::V185,
+                    tpm_version: tpm_version.map(|v| match v {
+                        TpmVersion::V138 => get_resources::ged::GedTpmVersion::V138,
+                        TpmVersion::V185 => get_resources::ged::GedTpmVersion::V185,
                     }),
                     firmware_event_send: None,
                     secure_boot_enabled: opt.secure_boot,
@@ -1608,7 +1619,7 @@ async fn vm_config_from_command_line(
         ]);
     }
 
-    if let Some(tpm_version) = opt.tpm
+    if let Some(tpm_version) = tpm_version
         && !opt.vtl2
     {
         let register_layout = if cfg!(guest_arch = "x86_64") {
@@ -1617,15 +1628,10 @@ async fn vm_config_from_command_line(
             TpmRegisterLayout::Mmio
         };
 
-        let tpm_version = match tpm_version {
-            TpmVersionCli::V138 => TpmVersion::V138,
-            TpmVersionCli::V185 => TpmVersion::V185,
-        };
-
         let (ppi_store, nvram_store) = if opt.vmgs.is_some() {
             (
                 VmgsFileHandle::new(vmgs_format::FileId::TPM_PPI, true).into_resource(),
-                VmgsFileHandle::new(tpm_version.to_nvram_vmgs_file_id(), true).into_resource(),
+                VmgsFileHandle::new(tpm_vmgs::tpm_nvram_file_id(tpm_version), true).into_resource(),
             )
         } else {
             (
@@ -1651,7 +1657,7 @@ async fn vm_config_from_command_line(
                     bios_guid,
                 }
                 .into_resource(),
-                worker_host: mesh.make_host("tpm", None).await?,
+                worker_host: mesh.make_sandboxed_host(SandboxRole::Tpm, None).await?,
             }
             .into_resource(),
         });
@@ -2182,9 +2188,6 @@ fn validate_snp_config(cfg: &Config) -> anyhow::Result<()> {
     ) {
         anyhow::bail!("SNP isolation currently only supports Linux direct or IGVM boot");
     }
-    if cfg.hypervisor.with_hv {
-        anyhow::bail!("SNP isolation currently does not support Hyper-V enlightenments");
-    }
     if cfg.hypervisor.with_vtl2.is_some() {
         anyhow::bail!("SNP isolation currently does not support VTL2");
     }
@@ -2654,6 +2657,8 @@ fn prepare_snapshot_restore(
 }
 
 fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> {
+    meshworker::apply_vmm_mesh_host_sandbox()?;
+
     #[cfg(windows)]
     pal::windows::disable_hard_error_dialog();
 
@@ -2883,7 +2888,9 @@ async fn run_control_inner(
     let (vm_rpc, rpc_recv) = mesh::channel();
     let (notify_send, notify_recv) = mesh::channel();
     let vm_worker = {
-        let vm_host = mesh.make_host("vm", opt.log_file.clone()).await?;
+        let vm_host = mesh
+            .make_sandboxed_host(SandboxRole::Vm, opt.log_file.clone())
+            .await?;
 
         let (shared_memory, saved_state) = if let Some(snapshot_dir) = &opt.restore_snapshot {
             let (fd, state_msg) = prepare_snapshot_restore(snapshot_dir, &opt)?;

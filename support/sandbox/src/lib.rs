@@ -16,11 +16,10 @@
 //!    worker. It returns a plain-data [`SandboxProcessConfig`] describing the
 //!    child's launch environment (which Linux namespaces to create, which
 //!    handles stay inheritable, the child's identity, and — on Windows — the
-//!    LPAC construction data). The caller merges that into whatever process
-//!    builder it already owns and performs the spawn.
+//!    LPAC construction data). The caller passes that prepared configuration
+//!    intact to the platform process builder, which performs the spawn.
 //!    This crate deliberately depends on neither `mesh` nor `pal`: it decides
-//!    *what* the launch environment must be; the caller decides *how* to apply
-//!    it.
+//!    *what* the launch environment must be; PAL decides *how* to apply it.
 //! 2. [`apply`] — the **first statement of the worker's `main()`**. On Linux the
 //!    worker configures the namespaces it was cloned into, then applies
 //!    `pivot_root`, credential drop, hardening, `no_new_privs`, and optional
@@ -30,13 +29,13 @@
 //!    has finished initializing, to shed its init-only authority. It takes
 //!    [`Restrictions`], a type that can only ever *narrow*.
 //!
-//! # Handle hygiene is the caller's job
+//! # Handle hygiene is the process builder's job
 //!
 //! There is no grant envelope and no descriptor sweep inside this crate.
 //! [`prepare`] reports exactly which tagged handles must remain inheritable;
-//! the caller keeps those inheritable and closes or marks every other
-//! descriptor before the child is reached. The one process that owns the
-//! descriptor table is the one that decides what leaves it.
+//! the platform process builder keeps those and its configured standard I/O
+//! inheritable while closing or marking every other descriptor before the
+//! child is reached.
 //!
 //! # Platform support
 //!

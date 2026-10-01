@@ -54,12 +54,10 @@ pub fn apply(profile: &Profile) -> Result<(), Error> {
     let p = &profile.inner;
 
     // Step 1 — detach propagation in the mount namespace created with the
-    // child, only when the profile isolates the filesystem. A profile with no
-    // filesystem grants does not request a mount namespace.
-    let isolate_fs = !p.fs.is_empty();
-    if isolate_fs {
-        mount_namespace::make_root_private().map_err(required("mount_namespace"))?;
-    }
+    // child. Even a profile with no filesystem grants pivots to a minimal
+    // tmpfs root; an empty grant set must deny rather than preserve the host
+    // filesystem view.
+    mount_namespace::make_root_private().map_err(required("mount_namespace"))?;
 
     // Step 2 — configure an isolated network namespace, when requested, before
     // filesystem setup so any FS step that could reach the network is already
@@ -68,9 +66,7 @@ pub fn apply(profile: &Profile) -> Result<(), Error> {
 
     // Step 3 — filesystem: tmpfs root, per-grant binds, /proc, /tmp,
     // pivot_root, then opportunistic Landlock.
-    if isolate_fs {
-        apply_filesystem(&p.fs)?;
-    }
+    apply_filesystem(&p.fs)?;
 
     // Step 4 — lock securebits *before* the capability drop, while we still
     // hold CAP_SETPCAP. Required (design §9): a worker that can regain root-like

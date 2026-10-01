@@ -7,6 +7,7 @@
 use crate::DiagInspector;
 use crate::cli_args::GuestPowerAction;
 use crate::meshworker::VmmMesh;
+use crate::sandbox_profiles::SandboxRole;
 use anyhow::Context;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -420,7 +421,7 @@ impl VmController {
     async fn handle_restart(&mut self) -> anyhow::Result<()> {
         let vm_host = self
             .mesh
-            .make_host("vm", self.log_file.clone())
+            .make_sandboxed_host(SandboxRole::Vm, self.log_file.clone())
             .await
             .context("spawning vm process failed")?;
         self.vm_worker.restart(&vm_host);
