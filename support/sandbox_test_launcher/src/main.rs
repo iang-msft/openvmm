@@ -14,13 +14,30 @@ use sandbox::Syscalls;
 use sandbox::profiles;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().any(|arg| arg == "--verify-capabilities-after-exec") {
+        verify_current_capabilities_dropped()?;
+        println!("all capability sets remain empty after exec");
+        return Ok(());
+    }
+    let skip_seccomp = std::env::args_os().any(|arg| arg == "--skip-seccomp");
+    let executable = std::env::current_exe()?;
     let syscall_denials = sandbox::platform_syscall_denylist()
         .map(|entry| entry.name)
         .collect::<Vec<_>>();
-    let profile = profiles::minimal()
+    let mut profile = profiles::minimal()
         .name("sandbox_test_launcher")
-        .syscalls(Syscalls::deny(syscall_denials))
-        .build();
+        .syscalls(Syscalls::deny(syscall_denials));
+    if skip_seccomp {
+        profile = profile
+            .read(executable.parent().expect("executable must have a parent"))
+            .read("/usr")
+            .syscalls(Syscalls::Unfiltered);
+        if std::path::Path::new("/lib64").exists() {
+            profile = profile.read("/lib64");
+        }
+    }
+    let profile = profile.build();
     let preparation = sandbox::prepare(&profile, &Identity::default(), &[])?;
 
     #[cfg(target_os = "linux")]
@@ -32,19 +49,33 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     verify_filesystem_after_apply()?;
 
-    let restrictions = Restrictions::none().syscalls(&["socket"]).build();
-    run_sandbox_stage("tighten", sandbox::tighten(&restrictions));
+    #[cfg(target_os = "linux")]
+    {
+        verify_current_capabilities_dropped()?;
+        if skip_seccomp {
+            verify_capabilities_after_exec(&executable)?;
+        }
+    }
 
-    #[cfg(all(target_os = "linux", debug_assertions))]
-    verify_socket_denied()?;
+    if !skip_seccomp {
+        let restrictions = Restrictions::none().syscalls(&["socket"]).build();
+        run_sandbox_stage("tighten", sandbox::tighten(&restrictions));
 
-    println!("sandbox applied and tightened successfully");
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        verify_socket_denied()?;
+    }
+
+    if skip_seccomp {
+        println!("sandbox applied successfully (seccomp skipped)");
+    } else {
+        println!("sandbox applied and tightened successfully");
+    }
     Ok(())
 }
 
 fn run_sandbox_stage(stage: &str, result: Result<(), sandbox::Error>) {
     if let Err(error) = result {
-        eprintln!("sandbox {stage} failed: {error}");
+        eprintln!("sandbox {stage} failed: {error:?}");
         std::process::exit(sandbox::EXIT_SANDBOX_FAILED);
     }
 }
@@ -125,6 +156,62 @@ fn verify_filesystem_after_apply() -> anyhow::Result<()> {
     );
 
     println!("filesystem visibility and access verified");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_capabilities_after_exec(executable: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use anyhow::ensure;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    ensure!(
+        executable.exists(),
+        "capability inheritance probe executable is not visible: {}",
+        executable.display()
+    );
+    let output = Command::new(executable)
+        .arg("--verify-capabilities-after-exec")
+        .stdin(Stdio::inherit())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to execute capability inheritance probe {}",
+                executable.display()
+            )
+        })?;
+    ensure!(
+        output.status.success(),
+        "capability inheritance probe failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    println!("all capability sets are empty before and after exec");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_current_capabilities_dropped() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use anyhow::ensure;
+    use caps::CapSet;
+
+    for set in [
+        CapSet::Ambient,
+        CapSet::Bounding,
+        CapSet::Inheritable,
+        CapSet::Effective,
+        CapSet::Permitted,
+    ] {
+        let capabilities = caps::read(None, set)
+            .with_context(|| format!("failed to read {set:?} capabilities"))?;
+        ensure!(
+            capabilities.is_empty(),
+            "sandbox retained {set:?} capabilities: {capabilities:?}"
+        );
+    }
     Ok(())
 }
 
