@@ -19,6 +19,10 @@ describes the source definitions.
   `MAJOR.MINOR.PATCH`. On Windows, the executable's `VERSIONINFO` uses the
   product version as `MAJOR.MINOR.PATCH.0`.
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
+* `--worker-trace-dir <DIR>`: On Linux, write structured syscall traces for
+  separate Mesh worker processes to this directory. Incompatible with
+  single-process mode. See `support/sandbox_profiler/README.md` for trace
+  collection and candidate sandbox profile generation.
 * `--memory <SPEC>`: Configure guest RAM. Defaults to `size=1G`.
   `SPEC` can be a size-only shorthand, such as `--memory 4G`, or a
   comma-separated key/value list:

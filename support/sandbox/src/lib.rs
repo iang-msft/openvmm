@@ -11,13 +11,16 @@
 //! # Integration status and limits
 //!
 //! PAL supports prepared Linux sandbox launches, and Mesh accepts optional
-//! sandbox profiles. Existing OpenVMM workers are not yet enabled: they still
-//! use ordinary launches and do not call the required early worker-side
-//! [`apply`]. Tracing and profiling are separate changes.
+//! sandbox profiles. OpenVMM enables the VM and TPM worker profiles for separate
+//! Linux workers and calls [`apply`] before worker initialization. Single-process
+//! mode does not isolate workers. Worker tracing and profile generation are
+//! provided by the `pal_tracer` and `sandbox_profiler` crates.
 //!
 //! On Linux, self-mapped workers retain their host UID/GID and PID visibility.
 //! Cross-process signaling is not yet restricted, so this is not a complete
 //! isolation boundary against other processes running under the same host UID.
+//! Arbitrary virtio-fs share roots, including hotplugged roots, still need policy
+//! and resource-handoff integration.
 //!
 //! # Three stages
 //!

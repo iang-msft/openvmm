@@ -20,12 +20,16 @@ use std::os::unix::prelude::*;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
+#[cfg(target_os = "linux")]
+use seccompiler::SeccompFilter;
+
 /// A container for linux specific builder options.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 pub struct LinuxBuilder<'a> {
     sandbox: Option<sandbox::SandboxProcessConfig>,
     vfork: bool,
+    trace_seccomp_filter: Option<SeccompFilter>,
     setsid: bool,
     controlling_terminal: Option<BorrowedFd<'a>>,
 }
@@ -266,6 +270,20 @@ impl<'a> Builder<'a> {
             io::ErrorKind::Unsupported,
             "sandboxed process launch is not implemented on this platform",
         ))
+    }
+
+    /// Stops the child before installing a tracing seccomp filter and
+    /// executing the new image so a ptrace supervisor can attach.
+    ///
+    /// The filter is compiled in the parent when spawning. Compilation failure
+    /// returns an error without creating a child.
+    ///
+    /// This disables `vfork` because a stopped `vfork` child would indefinitely
+    /// block the spawning thread.
+    #[cfg(target_os = "linux")]
+    pub fn set_trace_seccomp_filter(&mut self, seccomp_filter: SeccompFilter) -> &mut Self {
+        self.linux_builder.trace_seccomp_filter = Some(seccomp_filter);
+        self
     }
 
     /// Gets whether the new process will vfork or not.

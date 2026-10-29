@@ -12,13 +12,16 @@ implemented (it fails loud rather than running unconfined).
 
 PAL supports prepared Linux sandbox launches through `Builder::apply_sandbox`,
 and Mesh exposes optional profiles through `ProcessConfig::new_with_sandbox`.
-Existing workers still use ordinary launches: worker enablement and the required
-early worker-side `apply` calls are separate changes. Tracing and profiling are
-not included.
+OpenVMM enables the VM and TPM worker profiles for separate Linux workers and
+calls `sandbox::apply` before worker initialization. Single-process mode does
+not isolate workers. Worker tracing and profile generation are described in
+`support/sandbox_profiler/README.md`.
 
 On Linux, self-mapped workers retain their host UID/GID and PID visibility.
 Cross-process signaling is not yet restricted, so this is not a complete
 isolation boundary against other processes running under the same host UID.
+Arbitrary virtio-fs share roots are not automatically granted, including roots
+introduced by hotplug; these need policy and resource-handoff integration.
 
 ## The three stages
 
@@ -50,7 +53,7 @@ without retrying with weaker isolation.
 
 ## Authoring a policy
 
-The proposed OpenVMM worker profiles live in dedicated modules under
+OpenVMM's default worker profiles live in dedicated modules under
 `src/profiles`. Each exports a function returning `Builder`.
 `SandboxRole` in `src/profiles/sandbox_profiles.rs` selects the matching builder
 and calls `.build()` to return a finished `Profile`:
