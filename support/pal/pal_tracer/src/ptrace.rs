@@ -111,10 +111,11 @@ fn target_arch() -> TargetArch {
 
 /// Represents a child running under ptrace-based syscall tracing.
 ///
-/// [`TracedChild::start`] moves the child process to a dedicated thread that
-/// performs the blocking ptrace work. [`TracedChild::wait`] receives the
-/// status sent by that thread after tracing finishes.
+/// [`TracedChild::start`] retains the child handle and starts a dedicated thread
+/// to perform blocking ptrace work using its PID. [`TracedChild::wait`] receives
+/// the status sent by that thread after tracing finishes.
 pub struct TracedChild {
+    _child: pal::unix::process::Child,
     completion: Option<async_channel::Receiver<io::Result<ExitStatus>>>,
 }
 
@@ -125,18 +126,32 @@ impl TracedChild {
         process_name: &str,
         config: TraceConfig,
     ) -> io::Result<Self> {
-        let pid = child.id();
+        let child_pid = child.id();
         let process_name = process_name.to_owned();
         let (send, recv) = async_channel::bounded(1);
+
         // ptrace is driven by blocking waitpid calls. Keep that state machine
         // on a dedicated thread and expose only its completion asynchronously.
-        std::thread::Builder::new()
-            .name(format!("ptrace-{process_name}-{pid}"))
+        let spawned = std::thread::Builder::new()
+            .name(format!("ptrace-{process_name}-{child_pid}"))
             .spawn(move || {
-                let result = trace_process(child, &process_name, &config);
+                let result = trace_process(child_pid, &process_name, &config);
                 let _ = send.send_blocking(result);
-            })?;
+            });
+
+        if let Err(spawn_error) = spawned {
+            if let Err(cleanup_error) = reap_child_on_trace_failure(child_pid, false) {
+                return Err(io::Error::other(format!(
+                    "failed to create tracing thread: {spawn_error}; \
+                     worker cleanup also failed: {cleanup_error}"
+                )));
+            }
+
+            return Err(spawn_error);
+        }
+
         Ok(Self {
+            _child: child,
             completion: Some(recv),
         })
     }
@@ -167,38 +182,60 @@ struct PendingSyscall {
 // follows new tasks, pairs selected syscall entries with exits, and serializes
 // the resulting activity as JSONL.
 fn trace_process(
-    child: pal::unix::process::Child,
+    child_pid: i32,
     process_name: &str,
     config: &TraceConfig,
 ) -> io::Result<ExitStatus> {
-    let root_pid = child.id();
-    fs_err::create_dir_all(&config.output_dir)?;
-    let trace_path = config.output_dir.join(format!(
-        "{}-{}.{root_pid}.jsonl",
-        sanitize_name(&config.file_prefix),
-        sanitize_name(process_name)
-    ));
-    // Batch writes so a slow output filesystem cannot stall a traced task at
-    // every syscall stop. The buffer is flushed when it fills and at exit.
-    let mut output = BufWriter::with_capacity(TRACE_BUFFER_CAPACITY, File::create(&trace_path)?);
+    let mut child_reaped = false;
 
-    wait_for_initial_stop(root_pid)?;
-    ptrace(
-        libc::PTRACE_SEIZE as _,
-        root_pid,
-        0,
-        trace_options() as usize,
-    )?;
+    let initialization: io::Result<_> = (|| {
+        fs_err::create_dir_all(&config.output_dir)?;
+
+        let trace_path = config.output_dir.join(format!(
+            "{}-{}.{child_pid}.jsonl",
+            sanitize_name(&config.file_prefix),
+            sanitize_name(process_name)
+        ));
+
+        // Batch writes so a slow output filesystem cannot stall a traced task at
+        // every syscall stop. The buffer is flushed when it fills and at exit.
+        let output = BufWriter::with_capacity(TRACE_BUFFER_CAPACITY, File::create(&trace_path)?);
+
+        wait_for_initial_stop(child_pid, &mut child_reaped)?;
+        ptrace(
+            libc::PTRACE_SEIZE as _,
+            child_pid,
+            0,
+            trace_options() as usize,
+        )?;
+
+        // Attachment succeeded; the cleanup scope ends here.
+        Ok((trace_path, output))
+    })();
+
+    let (trace_path, mut output) = match initialization {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            if let Err(cleanup_error) = reap_child_on_trace_failure(child_pid, child_reaped) {
+                return Err(io::Error::other(format!(
+                    "{error}; worker cleanup also failed: {cleanup_error}"
+                )));
+            }
+
+            return Err(error);
+        }
+    };
+
     // Release the pre-exec group stop. PTRACE_O_TRACEEXEC guarantees another
     // stop before the child's new image executes user code.
     // SAFETY: kill accepts any PID and signal value; errors are reported via errno.
-    syscall_result(unsafe { libc::kill(root_pid, libc::SIGCONT) })?;
+    syscall_result(unsafe { libc::kill(child_pid, libc::SIGCONT) })?;
 
     write_event(
         &mut output,
         json!({
             "event": "trace_started",
-            "pid": root_pid,
+            "pid": child_pid,
             "trace_file": trace_path,
         }),
     )?;
@@ -207,7 +244,7 @@ fn trace_process(
     // one wait queue. The optional value tracks whether that task is between a
     // selected syscall's entry and exit stops.
     let mut tasks = HashMap::<i32, Option<PendingSyscall>>::new();
-    tasks.insert(root_pid, None);
+    tasks.insert(child_pid, None);
 
     loop {
         let mut status = 0;
@@ -221,16 +258,15 @@ fn trace_process(
                 &mut output,
                 json!({
                     "event": "task_exit",
-                    "pid": root_pid,
+                    "pid": child_pid,
                     "tid": tid,
                     "exit_code": libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)),
                     "signal": libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status)),
                 }),
             )?;
             tasks.remove(&tid);
-            if tid == root_pid {
+            if tid == child_pid {
                 output.flush()?;
-                drop(child);
                 return Ok(ExitStatus::from_raw(status));
             }
             continue;
@@ -246,13 +282,13 @@ fn trace_process(
         // All other tasks run with PTRACE_CONT so unrelated syscalls do not
         // generate entry/exit stops.
         if signal == (libc::SIGTRAP | 0x80) {
-            handle_syscall_exit(&mut output, root_pid, tid, tasks.entry(tid).or_default())?;
+            handle_syscall_exit(&mut output, child_pid, tid, tasks.entry(tid).or_default())?;
             resume_cont(tid, 0)?;
         } else if signal == libc::SIGTRAP && event == libc::PTRACE_EVENT_SECCOMP {
             handle_seccomp_stop(tid, tasks.entry(tid).or_default(), &config.syscalls)?;
             resume_syscall(tid, 0)?;
         } else if signal == libc::SIGTRAP && event != 0 {
-            handle_ptrace_event(&mut output, root_pid, tid, event, &mut tasks)?;
+            handle_ptrace_event(&mut output, child_pid, tid, event, &mut tasks)?;
             resume_task(tid, tasks.get(&tid).is_some_and(Option::is_some), 0)?;
         } else {
             // Synthetic SIGTRAP stops were handled above; deliver real traps.
@@ -262,16 +298,60 @@ fn trace_process(
     }
 }
 
-fn wait_for_initial_stop(pid: i32) -> io::Result<()> {
-    let mut status = 0;
-    // SAFETY: status points to writable memory, and WUNTRACED is a valid waitpid flag.
-    syscall_result(unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) })?;
+fn wait_for_initial_stop(pid: i32, child_reaped: &mut bool) -> io::Result<()> {
+    let status = loop {
+        let mut status = 0;
+        // SAFETY: status is writable.
+        match syscall_result(unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) }) {
+            Ok(_) => break status,
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+        *child_reaped = true;
+    }
+
     if !libc::WIFSTOPPED(status) || libc::WSTOPSIG(status) != libc::SIGSTOP {
         return Err(io::Error::other(format!(
             "child {pid} did not stop before exec: status {status:#x}"
         )));
     }
+
     Ok(())
+}
+
+fn reap_child_on_trace_failure(child_pid: i32, child_reaped: bool) -> io::Result<()> {
+    if child_reaped {
+        return Ok(());
+    }
+
+    if child_pid <= 0 {
+        return Err(io::Error::other("invalid cleanup process id"));
+    }
+
+    // SAFETY: child_pid identifies the worker we spawned.
+    let result = syscall_result(unsafe { libc::kill(child_pid, libc::SIGKILL) });
+    if let Err(error) = result {
+        // Ignore ESRCH ("No such process"): kill could not find the worker PID.
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+
+    loop {
+        let mut status = 0;
+        // SAFETY: status is writable; flags=0 waits for this untraced child's exit.
+        match syscall_result(unsafe { libc::waitpid(child_pid, &mut status, 0) }) {
+            Ok(_) => return Ok(()),
+            // A signal interrupted the wait; retry instead of abandoning cleanup.
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+            // No child with this PID remains for our process to wait for.
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 // Records process-tree changes reported by ptrace and enrolls newly created
@@ -650,6 +730,9 @@ mod tests {
     use std::io::BufRead;
     use std::mem::align_of;
     use std::mem::offset_of;
+    use std::os::fd::AsFd;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::BorrowedFd;
     use test_with_tracing::test;
 
     #[test]
@@ -789,6 +872,105 @@ mod tests {
                 })
         );
         assert!(events.iter().any(|event| event["event"] == "task_exit"));
+    }
+
+    #[test]
+    fn initialization_failure_reaps_worker() {
+        for fail_file_creation in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let output_dir = if fail_file_creation {
+                dir.path().to_path_buf()
+            } else {
+                let path = dir.path().join("output");
+                File::create(&path).unwrap();
+                path
+            };
+
+            let config = TraceConfig::new(
+                output_dir,
+                "worker",
+                BTreeMap::from([(libc::SYS_openat, "openat".to_string())]),
+            );
+
+            let mut command = pal::unix::process::Builder::new("/usr/bin/true");
+            command.set_trace_seccomp_filter(build_seccomp_filter(&config).unwrap());
+            let child = command.spawn().unwrap();
+            let child_pid = child.id();
+            let pidfd = child.as_fd().try_clone_to_owned().unwrap();
+
+            if fail_file_creation {
+                fs_err::create_dir(
+                    dir.path()
+                        .join(format!("worker-test-worker.{child_pid}.jsonl")),
+                )
+                .unwrap();
+            }
+
+            let mut traced = TracedChild::start(child, "test-worker", config).unwrap();
+            let result = futures::executor::block_on(traced.wait());
+
+            assert_worker_reaped(child_pid, pidfd.as_fd());
+
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if fail_file_creation {
+                    io::ErrorKind::IsADirectory
+                } else {
+                    io::ErrorKind::AlreadyExists
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_before_tracer_start_reaps_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = TraceConfig::new(dir.path().to_path_buf(), "worker", BTreeMap::new());
+
+        let mut command = pal::unix::process::Builder::new("/usr/bin/true");
+        command.set_trace_seccomp_filter(build_seccomp_filter(&config).unwrap());
+        let child = command.spawn().unwrap();
+        let child_pid = child.id();
+
+        reap_child_on_trace_failure(child_pid, false).unwrap();
+
+        assert_worker_reaped(child_pid, child.as_fd());
+    }
+
+    fn assert_worker_reaped(child_pid: i32, pidfd: BorrowedFd<'_>) {
+        let mut status = 0;
+        // SAFETY: status is writable.
+        let result =
+            syscall_result(unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) });
+
+        if matches!(&result, Ok(0)) {
+            // Clean up before failing the assertion, using the original worker's pidfd.
+            // SAFETY: pidfd identifies this test's worker.
+            syscall_result(unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            })
+            .unwrap();
+
+            loop {
+                // SAFETY: status is writable.
+                match syscall_result(unsafe { libc::waitpid(child_pid, &mut status, 0) }) {
+                    Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                    _ => break,
+                }
+            }
+        }
+
+        assert!(
+            matches!(result, Err(error) if error.raw_os_error() == Some(libc::ECHILD)),
+            "worker {child_pid} was not reaped"
+        );
     }
 
     #[test]
