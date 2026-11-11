@@ -24,6 +24,7 @@ use std::mem::size_of;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::ExitStatus;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -508,9 +509,13 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
     // filesystem and network policy generation; unreadable tracee memory is
     // represented by a null decoded value rather than aborting collection.
     if sys_nr == libc::SYS_renameat2 as u64 {
+        let path = read_c_string(tid, args[1]).ok();
+        let path2 = read_c_string(tid, args[3]).ok();
         return json!({
-            "path": read_c_string(tid, args[1]).ok(),
-            "path2": read_c_string(tid, args[3]).ok(),
+            "path_base": path_base(tid, args[0], path.as_deref()),
+            "path2_base": path_base(tid, args[2], path2.as_deref()),
+            "path": path,
+            "path2": path2,
         });
     }
 
@@ -529,7 +534,11 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
     };
 
     if let Some(path) = path_address.and_then(|address| read_c_string(tid, address).ok()) {
-        return json!({ "path": path });
+        return json!({
+            "path_base": path_base(tid, args[0], Some(&path)),
+            "path_target": empty_path_target(tid, sys_nr, args, &path),
+            "path": path,
+        });
     }
 
     let socket_address = if sys_nr == libc::SYS_bind as u64 || sys_nr == libc::SYS_connect as u64 {
@@ -544,6 +553,49 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
     }
 
     Value::Null
+}
+
+fn path_base(tid: i32, dirfd: u64, path: Option<&str>) -> Option<String> {
+    let path = Path::new(path?);
+    if path.is_absolute() || path.as_os_str().is_empty() {
+        return None;
+    }
+
+    let base = fd_target(tid, dirfd)?;
+    if !Path::new(&base).is_absolute() || base.ends_with(" (deleted)") {
+        return None;
+    }
+    Some(base)
+}
+
+fn empty_path_target(tid: i32, sys_nr: u64, args: [u64; 6], path: &str) -> Option<String> {
+    if !path.is_empty() {
+        return None;
+    }
+    let uses_descriptor =
+        if sys_nr == libc::SYS_newfstatat as u64 || sys_nr == libc::SYS_faccessat2 as u64 {
+            args[3] & libc::AT_EMPTY_PATH as u64 != 0
+        } else if sys_nr == libc::SYS_statx as u64 {
+            args[2] & libc::AT_EMPTY_PATH as u64 != 0
+        } else {
+            sys_nr == libc::SYS_readlinkat as u64
+        };
+    uses_descriptor.then(|| fd_target(tid, args[0])).flatten()
+}
+
+fn fd_target(tid: i32, dirfd: u64) -> Option<String> {
+    // dirfd is an int, even when the syscall register contains a sign-extended value.
+    let dirfd = dirfd as libc::c_int;
+    let link = if dirfd == libc::AT_FDCWD {
+        format!("/proc/{tid}/cwd")
+    } else {
+        format!("/proc/{tid}/fd/{dirfd}")
+    };
+    fs_err::read_link(link)
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()
 }
 
 fn decode_socket_address(tid: i32, address: u64, length: u64) -> io::Result<Value> {
@@ -825,6 +877,192 @@ mod tests {
             parse_socket_address(&bytes),
             Some(("AF_INET6", "::1".to_string(), 443))
         );
+    }
+
+    #[test]
+    fn decodes_relative_path_bases() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = File::open(dir.path()).unwrap();
+        let tid = std::process::id() as i32;
+        let cwd = std::env::current_dir().unwrap();
+        let directory_path = fs_err::canonicalize(dir.path()).unwrap();
+        let path = c"glibc-hwcaps/x86-64-v2/libgcc_s.so.1";
+
+        for (dirfd, expected) in [
+            (libc::AT_FDCWD as u32 as u64, &cwd),
+            (libc::AT_FDCWD as i64 as u64, &cwd),
+            (directory.as_raw_fd() as u64, &directory_path),
+        ] {
+            let decoded = decode_args(
+                tid,
+                libc::SYS_openat as u64,
+                [dirfd, path.as_ptr() as u64, 0, 0, 0, 0],
+            );
+            assert_eq!(decoded["path"], path.to_str().unwrap());
+            assert_eq!(decoded["path_base"], expected.to_str().unwrap());
+        }
+
+        for (dirfd, path) in [
+            (directory.as_raw_fd() as u64, c"/absolute/library.so"),
+            (directory.as_raw_fd() as u64, c""),
+            (u32::MAX as u64, c"relative"),
+        ] {
+            let decoded = decode_args(
+                tid,
+                libc::SYS_openat as u64,
+                [dirfd, path.as_ptr() as u64, 0, 0, 0, 0],
+            );
+            assert_eq!(decoded["path"], path.to_str().unwrap());
+            assert!(decoded["path_base"].is_null());
+        }
+    }
+
+    #[test]
+    fn decodes_both_rename_path_bases() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source_fd = File::open(source.path()).unwrap();
+        let destination_fd = File::open(destination.path()).unwrap();
+        let decoded = decode_args(
+            std::process::id() as i32,
+            libc::SYS_renameat2 as u64,
+            [
+                source_fd.as_raw_fd() as u64,
+                c"old".as_ptr() as u64,
+                destination_fd.as_raw_fd() as u64,
+                c"new".as_ptr() as u64,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(decoded["path"], "old");
+        assert_eq!(decoded["path2"], "new");
+        assert_eq!(
+            decoded["path_base"],
+            fs_err::canonicalize(source.path())
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            decoded["path2_base"],
+            fs_err::canonicalize(destination.path())
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn decodes_empty_path_descriptor_targets() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let directory = File::open(dir.path()).unwrap();
+        let tid = std::process::id() as i32;
+        let file_path = fs_err::canonicalize(file.path()).unwrap();
+        let directory_path = fs_err::canonicalize(dir.path()).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+
+        for (dirfd, expected) in [
+            (file.as_raw_fd() as u64, &file_path),
+            (directory.as_raw_fd() as u64, &directory_path),
+            (libc::AT_FDCWD as u32 as u64, &cwd),
+            (libc::AT_FDCWD as i64 as u64, &cwd),
+        ] {
+            for (sys_nr, flags_index) in [
+                (libc::SYS_newfstatat, Some(3)),
+                (libc::SYS_statx, Some(2)),
+                (libc::SYS_faccessat2, Some(3)),
+                (libc::SYS_readlinkat, None),
+            ] {
+                let mut args = [dirfd, c"".as_ptr() as u64, 0, 0, 0, 0];
+                if let Some(index) = flags_index {
+                    args[index] = libc::AT_EMPTY_PATH as u64;
+                }
+                let decoded = decode_args(tid, sys_nr as u64, args);
+                assert_eq!(decoded["path"], "");
+                assert!(decoded["path_base"].is_null());
+                assert_eq!(decoded["path_target"], expected.to_str().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_path_targets_require_descriptor_semantics() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let tid = std::process::id() as i32;
+        let dirfd = file.as_raw_fd() as u64;
+        for sys_nr in [
+            libc::SYS_newfstatat,
+            libc::SYS_statx,
+            libc::SYS_faccessat2,
+            libc::SYS_openat,
+        ] {
+            let decoded = decode_args(tid, sys_nr as u64, [dirfd, c"".as_ptr() as u64, 0, 0, 0, 0]);
+            assert_eq!(decoded["path"], "");
+            assert!(decoded["path_target"].is_null());
+        }
+        for (sys_nr, dirfd, path) in [
+            (libc::SYS_faccessat, dirfd, c""),
+            (libc::SYS_newfstatat, u32::MAX as u64, c""),
+            (libc::SYS_newfstatat, dirfd, c"relative"),
+        ] {
+            let decoded = decode_args(
+                tid,
+                sys_nr as u64,
+                [
+                    dirfd,
+                    path.as_ptr() as u64,
+                    0,
+                    libc::AT_EMPTY_PATH as u64,
+                    0,
+                    0,
+                ],
+            );
+            assert_eq!(decoded["path"], path.to_str().unwrap());
+            assert!(decoded["path_target"].is_null());
+        }
+    }
+
+    #[test]
+    fn retains_non_path_and_deleted_descriptor_targets() {
+        let tid = std::process::id() as i32;
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deleted");
+        let file = File::create(&path).unwrap();
+        let file_path = fs_err::canonicalize(&path).unwrap();
+        fs_err::remove_file(&path).unwrap();
+        for (dirfd, expected) in [
+            (
+                socket.as_raw_fd() as u64,
+                fs_err::read_link(format!("/proc/{tid}/fd/{}", socket.as_raw_fd()))
+                    .unwrap()
+                    .into_os_string()
+                    .into_string()
+                    .unwrap(),
+            ),
+            (
+                file.as_raw_fd() as u64,
+                format!("{} (deleted)", file_path.display()),
+            ),
+        ] {
+            let decoded = decode_args(
+                tid,
+                libc::SYS_newfstatat as u64,
+                [
+                    dirfd,
+                    c"".as_ptr() as u64,
+                    0,
+                    libc::AT_EMPTY_PATH as u64,
+                    0,
+                    0,
+                ],
+            );
+            assert_eq!(decoded["path"], "");
+            assert_eq!(decoded["path_target"], expected);
+            assert!(decoded["path_base"].is_null());
+        }
     }
 
     #[test]

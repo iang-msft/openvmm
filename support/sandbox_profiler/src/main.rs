@@ -36,6 +36,7 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     println!("generated profile: {}", trace_report.profile_path.display());
+    println!("generated log: {}", trace_report.log_path.display());
     println!("trace files: {}", trace_report.trace_files.len());
 
     if trace_report.observed_filesystem.is_empty() {
@@ -66,13 +67,6 @@ fn main() -> anyhow::Result<()> {
         "read-write grants: {}",
         trace_report.policy_read_write_paths.len()
     );
-    if !trace_report.policy_filesystem_access_omissions.is_empty() {
-        println!("filesystem grant omissions:");
-        for omission in &trace_report.policy_filesystem_access_omissions {
-            println!("  - {omission}");
-        }
-    }
-
     println!(
         "generated network policy: {:?}",
         trace_report.policy_network

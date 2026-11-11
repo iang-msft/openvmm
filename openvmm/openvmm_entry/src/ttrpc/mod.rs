@@ -93,12 +93,17 @@ use sandbox::profiles::SandboxRole;
 use scsidisk_resources::SimpleScsiDiskHandle;
 use std::fs::File;
 use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use storvsp_resources::ScsiControllerHandle;
 use storvsp_resources::ScsiControllerRequest;
 use storvsp_resources::ScsiDeviceAndPath;
+use tpm_resources::TpmDeviceHandle;
+use tpm_resources::TpmRegisterLayout;
+use tpm_resources::TpmVersion;
 use unix_socket::UnixListener;
 use virtio_resources::VirtioPciDeviceHandle;
 use vm_manifest_builder::VmManifestBuilder;
@@ -111,6 +116,7 @@ use vm_resource::kind::SerialBackendHandle;
 use vm_resource::kind::VirtioDeviceHandle;
 use vm_resource::kind::VmbusDeviceHandleKind;
 use vmcore::non_volatile_store::resources::EphemeralNonVolatileStoreHandle;
+use vmotherboard::ChipsetDeviceHandle;
 use vmservice::uefi::initial_variables::SecureBootTemplate;
 
 #[cfg(guest_arch = "aarch64")]
@@ -164,6 +170,9 @@ fn parse_arch_topology_overrides(
 pub struct Parameters {
     pub listener: UnixListener,
     pub transport: RpcTransport,
+    #[cfg(target_os = "linux")]
+    pub worker_trace_dir: Option<Vec<u8>>,
+    pub tpm_version: Option<TpmVersion>,
 }
 
 #[derive(Copy, Clone, mesh::MeshPayload)]
@@ -338,6 +347,9 @@ mod dispatch {
 pub struct TtrpcWorker {
     listener: UnixListener,
     transport: ResolvedTransport,
+    #[cfg(target_os = "linux")]
+    worker_trace_dir: Option<PathBuf>,
+    tpm_version: Option<TpmVersion>,
 }
 
 pub const TTRPC_WORKER: WorkerId<Parameters> = WorkerId::new("TtrpcWorker");
@@ -360,6 +372,11 @@ impl Worker for TtrpcWorker {
                 #[allow(unreachable_patterns)]
                 transport => bail!("unsupported transport {transport}"),
             },
+            #[cfg(target_os = "linux")]
+            worker_trace_dir: parameters
+                .worker_trace_dir
+                .map(|path| std::ffi::OsString::from_vec(path).into()),
+            tpm_version: parameters.tpm_version,
         })
     }
 
@@ -380,6 +397,9 @@ impl Worker for TtrpcWorker {
                 rpc_tasks: Vec::new(),
                 transport: self.transport,
                 registry: FdRegistry::default(),
+                #[cfg(target_os = "linux")]
+                worker_trace_dir: self.worker_trace_dir,
+                tpm_version: self.tpm_version,
             };
             service.run(self.listener, recv).await?;
             Ok(())
@@ -714,6 +734,9 @@ impl From<&VmLifecycle> for vmservice::VmState {
 
 struct VmService {
     driver: DefaultDriver,
+    #[cfg(target_os = "linux")]
+    worker_trace_dir: Option<PathBuf>,
+    tpm_version: Option<TpmVersion>,
     vm: Option<Arc<Vm>>,
     vm_controller: Option<mesh::Sender<VmControllerRpc>>,
     vm_controller_events: Option<mesh::Receiver<VmControllerEvent>>,
@@ -1052,7 +1075,7 @@ impl VmService {
                         enable_memory_protections: false,
                         enable_debugging: false,
                         disable_frontpage: false,
-                        tpm_version: None,
+                        tpm_version: self.tpm_version,
                         enable_battery: false,
                         enable_vpci_boot: false,
                         default_boot_always_attempt: false,
@@ -1315,8 +1338,35 @@ impl VmService {
             &self.driver,
             false,
             #[cfg(target_os = "linux")]
-            None,
+            self.worker_trace_dir.clone(),
         )?;
+        if let Some(version) = self.tpm_version {
+            config.chipset_devices.push(ChipsetDeviceHandle {
+                name: "tpm".to_string(),
+                resource: chipset_device_worker_defs::RemoteChipsetDeviceHandle {
+                    device: TpmDeviceHandle {
+                        version,
+                        ppi_store: EphemeralNonVolatileStoreHandle.into_resource(),
+                        nvram_store: EphemeralNonVolatileStoreHandle.into_resource(),
+                        nvram_size: None,
+                        refresh_tpm_seeds: false,
+                        ak_cert_type: tpm_resources::TpmAkCertTypeResource::None,
+                        register_layout: if cfg!(guest_arch = "x86_64") {
+                            TpmRegisterLayout::IoPort
+                        } else {
+                            TpmRegisterLayout::Mmio
+                        },
+                        guest_secret_key: None,
+                        logger: None,
+                        is_confidential_vm: false,
+                        bios_guid: Guid::new_random(),
+                    }
+                    .into_resource(),
+                    worker_host: mesh.make_sandboxed_host(SandboxRole::Tpm, None).await?,
+                }
+                .into_resource(),
+            });
+        }
         let vm_host = mesh
             .make_sandboxed_host(SandboxRole::Vm, None)
             .await

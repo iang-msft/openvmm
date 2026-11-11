@@ -85,7 +85,11 @@ trace files.
 `worker-<worker-name>.<pid>.jsonl`.
 
 `--output-dir <OUTPUT_DIR>` is optional. Without it, the profile builder writes
-the generated profile to `<TRACE_DIR>/<WORKER>_worker.rs`.
+the generated profile to `<TRACE_DIR>/<WORKER>_worker.rs` and a detailed report
+to `<TRACE_DIR>/<WORKER>_worker.log`. With an output directory, both files are
+written there. The Rust file starts with a single generated-profile comment
+followed by the policy code. The log contains the trace count, observed filesystem
+and network accesses, observed syscalls, and observed policy denials.
 
 The profile builder uses the platform denylist exposed by the `sandbox`
 crate.
@@ -95,16 +99,50 @@ integrated into the worker.
 
 #### Filesystem policy
 
-The profile builder uses the file accesses in the trace to determine which
-directories the worker needs to read or modify. Read access under `/sys`
-produces `.read(...)` entries, which allow reads and directory traversal but
-not execution. Other read access conservatively produces `.read_exec(...)`
+The profile builder uses successful file accesses in the trace to determine which
+directories the worker needs to read or modify. A nonnegative syscall result is
+required to generate a filesystem grant. Failed accesses and accesses without a
+recorded result remain in the observations. A later
+successful access to the same path can still generate a grant using that call's
+requested permissions.
+
+Filesystem observations use `file_path, access mode, retval`, for example
+`/usr/lib/libc.so.6, RO, SUCCESS` or `/denied/state, RW, EACCES`.
+Successful results appear as `SUCCESS`. Error names come from the trace's errno
+when available, otherwise from the negative syscall result. Unmapped error
+numbers appear as `ERRNO_<number>`; missing outcomes appear as `UNKNOWN`.
+
+For empty-path descriptor operations, the tracer preserves the original
+`path: ""` and records `path_target` at syscall entry from `/proc/<tid>/fd/<dirfd>`,
+or `/proc/<tid>/cwd` for `AT_FDCWD`. This applies to `newfstatat`, `statx`, and
+`faccessat2` with `AT_EMPTY_PATH`, and to `readlinkat` with an empty pathname.
+The filesystem observation uses that recorded target. Non-path descriptor
+descriptions, such as `anon_inode:[eventpoll]`, and deleted-file annotations are
+preserved. When the target is unavailable or absent in an older trace, the
+observation uses an explicit description such as
+`<empty pathname; statx; dirfd: 8>, RO, SUCCESS`. These descriptor-based
+observations do not produce additional pathname grants.
+
+Read access under `/sys` produces `.read(...)` entries, which allow reads and
+directory traversal but not execution. Other read access conservatively produces `.read_exec(...)`
 entries because the trace does not capture executable mappings of shared
 libraries. Review these grants and use `.read(...)` for data that does not
 need execution. Write access produces non-executable `.read_write(...)` entries.
-`/proc` and `/tmp` are provided by the sandbox and are described in the
-generated profile's filesystem notes instead of being added as directory
-entries.
+`/proc` and `/tmp` are provided by the sandbox. Accesses remain in the
+observations without additional directory entries. Root-wide grants are also
+excluded.
+
+For relative filesystem paths, the tracer records `path_base` at syscall entry:
+the calling thread's current directory for `AT_FDCWD`, or the directory referenced
+by the supplied file descriptor. `renameat2` records a separate `path2_base` for
+its destination. The original pathname is preserved, and the profile builder
+combines it with the recorded base to produce an absolute lookup path, including
+for failed lookups whose targets do not exist. The result names the lookup
+location, preserving symlinks in the pathname. An unavailable base is recorded as
+`null` and the observation retains the original relative pathname instead of
+guessing an absolute path. Older traces without these fields retain
+file-descriptor tracking as a fallback, but cannot resolve relative `AT_FDCWD`
+paths.
 
 #### Network policy
 

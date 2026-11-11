@@ -2788,6 +2788,15 @@ fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> 
                     mesh_worker::launch_local_worker::<ttrpc::TtrpcWorker>(ttrpc::Parameters {
                         listener,
                         transport,
+                        #[cfg(target_os = "linux")]
+                        worker_trace_dir: opt
+                            .worker_trace_dir
+                            .as_ref()
+                            .map(|path| path.as_os_str().as_encoded_bytes().to_vec()),
+                        tpm_version: opt.tpm.map(|version| match version {
+                            TpmVersionCli::V138 => TpmVersion::V138,
+                            TpmVersionCli::V185 => TpmVersion::V185,
+                        }),
                     })
                     .await?;
 

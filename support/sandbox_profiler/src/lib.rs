@@ -36,7 +36,7 @@ pub struct TraceOptions {
     pub trace_dir: PathBuf,
     /// Worker name used to select trace files and name the generated profile.
     pub worker: String,
-    /// Directory where the generated Rust source file is written.
+    /// Directory where the generated Rust source and report are written.
     pub output_dir: PathBuf,
 }
 
@@ -45,6 +45,8 @@ pub struct TraceOptions {
 pub struct TraceReport {
     /// Generated Rust source file.
     pub profile_path: PathBuf,
+    /// Detailed trace observations.
+    pub log_path: PathBuf,
     /// Trace files consumed.
     pub trace_files: Vec<PathBuf>,
 
@@ -59,8 +61,6 @@ pub struct TraceReport {
     pub policy_read_paths: Vec<PathBuf>,
     /// Read-write directory grants emitted.
     pub policy_read_write_paths: Vec<PathBuf>,
-    /// Filesystem behavior that was not converted into an explicit grant.
-    pub policy_filesystem_access_omissions: Vec<String>,
     /// Network policy generated from the trace.
     pub policy_network: sandbox::Network,
     /// Default syscall denials that were not observed and were emitted.
@@ -80,8 +80,13 @@ struct TraceAnalysis {
 
     policy_read_paths: BTreeSet<PathBuf>,
     policy_read_write_paths: BTreeSet<PathBuf>,
-    policy_filesystem_access_omissions: BTreeSet<String>,
     policy_network: sandbox::Network,
+}
+
+#[derive(Default)]
+struct PathMetadata<'a> {
+    base: Option<&'a Value>,
+    target: Option<&'a Value>,
 }
 
 /// Generate a sandbox profile template from the worker trace.
@@ -123,29 +128,36 @@ pub fn build_profile(trace_options: &TraceOptions) -> anyhow::Result<TraceReport
         .with_context(|| format!("failed to create {}", trace_options.output_dir.display()))?;
     let profile_path = trace_options.output_dir.join(format!("{module_name}.rs"));
     let source = render_profile(
-        &trace_options.worker,
+        &worker_file_name,
         &module_name,
-        &trace_files,
         &trace_analysis,
         &syscall_denylist,
     );
     fs_err::write(&profile_path, source)
         .with_context(|| format!("failed to write {}", profile_path.display()))?;
+    let log_path = trace_options
+        .output_dir
+        .join(format!("{worker_file_name}_worker.log"));
+    let log = render_report(
+        &worker_file_name,
+        &trace_files,
+        &trace_analysis,
+        &syscall_denylist,
+    );
+    fs_err::write(&log_path, log)
+        .with_context(|| format!("failed to write {}", log_path.display()))?;
     let policy_syscalls = generated_syscall_denials(&syscall_denylist, &trace_analysis);
     let policy_network = trace_analysis.policy_network;
 
     Ok(TraceReport {
         profile_path,
+        log_path,
         trace_files,
         observed_filesystem: trace_analysis.observed_filesystem.into_iter().collect(),
         observed_network: trace_analysis.observed_network.into_iter().collect(),
         observed_syscalls: trace_analysis.observed_syscalls.into_iter().collect(),
         policy_read_paths: trace_analysis.policy_read_paths.into_iter().collect(),
         policy_read_write_paths: trace_analysis.policy_read_write_paths.into_iter().collect(),
-        policy_filesystem_access_omissions: trace_analysis
-            .policy_filesystem_access_omissions
-            .into_iter()
-            .collect(),
         policy_network,
         policy_syscalls,
     })
@@ -224,7 +236,18 @@ fn ingest_trace(
             .and_then(|decoded| decoded.get("path"))
             .and_then(Value::as_str)
         {
-            observe_path(syscall, args, path, result, trace_analysis);
+            observe_path(
+                syscall,
+                args,
+                path,
+                PathMetadata {
+                    base: decoded.and_then(|decoded| decoded.get("path_base")),
+                    target: decoded.and_then(|decoded| decoded.get("path_target")),
+                },
+                result,
+                errno,
+                trace_analysis,
+            );
         }
         if let Some(path) = decoded
             .and_then(|decoded| decoded.get("path2"))
@@ -232,7 +255,18 @@ fn ingest_trace(
         {
             let mut path_args = args;
             path_args[0] = args[2];
-            observe_path(syscall, path_args, path, result, trace_analysis);
+            observe_path(
+                syscall,
+                path_args,
+                path,
+                PathMetadata {
+                    base: decoded.and_then(|decoded| decoded.get("path2_base")),
+                    target: None,
+                },
+                result,
+                errno,
+                trace_analysis,
+            );
         }
     }
     Ok(())
@@ -252,67 +286,65 @@ fn observe_path(
     syscall: &str,
     args: [u64; 6],
     raw_path: &str,
+    metadata: PathMetadata<'_>,
     result: Option<i64>,
+    errno: Option<i64>,
     trace_analysis: &mut TraceAnalysis,
 ) {
     let is_write = path_is_written(syscall, args);
     let access = if is_write { "RW" } else { "RO" };
-    let Some(path) = resolve_filesystem_path(raw_path, args[0], trace_analysis) else {
+    let outcome = access_outcome(result, errno);
+    if raw_path.is_empty() {
+        let target = metadata
+            .target
+            .and_then(Value::as_str)
+            .filter(|target| !target.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "<empty pathname; {syscall}; dirfd: {}>",
+                    format_dirfd(args[0])
+                )
+            });
         trace_analysis
             .observed_filesystem
-            .insert(format!("{raw_path} ({access})"));
+            .insert(format!("{target}, {access}, {outcome}"));
+        // This is an existing descriptor, not a new pathname lookup.
+        return;
+    }
+    let Some(path) = resolve_filesystem_path(raw_path, args[0], metadata.base, trace_analysis)
+    else {
         trace_analysis
-            .policy_filesystem_access_omissions
-            .insert(format!(
-                "Relative path {raw_path} from {syscall} was not converted to a grant (dirfd: {}).",
-                format_dirfd(args[0])
-            ));
+            .observed_filesystem
+            .insert(format!("{raw_path}, {access}, {outcome}"));
         return;
     };
 
     trace_analysis
         .observed_filesystem
-        .insert(format!("{} ({access})", path.display()));
+        .insert(format!("{}, {access}, {outcome}", path.display()));
 
-    if syscall == "openat"
-        && let Some(fd) = result.filter(|result| *result >= 0)
-    {
+    let Some(result) = result.filter(|result| *result >= 0) else {
+        return;
+    };
+
+    if syscall == "openat" {
         // Remember the returned path so a later relative *at call using this
         // fd can be resolved to an absolute path.
-        trace_analysis.filesystem_fd_paths.insert(fd, path.clone());
+        trace_analysis
+            .filesystem_fd_paths
+            .insert(result, path.clone());
     }
 
     // The sandbox creates its own /proc and /tmp mounts. Granting the host
     // versions would give the worker different access from what it requested.
-    if path.starts_with("/proc") {
-        trace_analysis
-            .policy_filesystem_access_omissions
-            .insert(format!(
-                "{} is provided by the sandbox's implicit /proc mount.",
-                path.display()
-            ));
-        return;
-    }
-    if path.starts_with("/tmp") {
-        trace_analysis
-            .policy_filesystem_access_omissions
-            .insert(format!(
-            "{} is under the sandbox's implicit empty writable /tmp; verify that host contents are not required.",
-            path.display()
-        ));
+    if path.starts_with("/proc") || path.starts_with("/tmp") {
         return;
     }
 
     let grant_path = directory_grant(&path);
-    // Granting / would expose the entire host filesystem. Report the access for
-    // review instead of generating that grant.
+    // Granting / would expose the entire host filesystem.
     if grant_path == Path::new("/") {
-        trace_analysis
-            .policy_filesystem_access_omissions
-            .insert(format!(
-                "{} would require granting /; no filesystem grant was generated.",
-                path.display()
-            ));
         return;
     }
 
@@ -323,18 +355,73 @@ fn observe_path(
     }
 }
 
+fn access_outcome(result: Option<i64>, errno: Option<i64>) -> String {
+    if result.is_some_and(|result| result >= 0) {
+        return "SUCCESS".to_string();
+    }
+    let Some(errno) = errno
+        .filter(|errno| *errno > 0)
+        .or_else(|| result.and_then(i64::checked_neg))
+    else {
+        return "UNKNOWN".to_string();
+    };
+    // These are Linux trace errno values, independent of the profiler's host OS.
+    let name = match errno {
+        1 => "EPERM",
+        2 => "ENOENT",
+        4 => "EINTR",
+        5 => "EIO",
+        6 => "ENXIO",
+        7 => "E2BIG",
+        9 => "EBADF",
+        11 => "EAGAIN",
+        12 => "ENOMEM",
+        13 => "EACCES",
+        14 => "EFAULT",
+        16 => "EBUSY",
+        17 => "EEXIST",
+        18 => "EXDEV",
+        19 => "ENODEV",
+        20 => "ENOTDIR",
+        21 => "EISDIR",
+        22 => "EINVAL",
+        23 => "ENFILE",
+        24 => "EMFILE",
+        26 => "ETXTBSY",
+        27 => "EFBIG",
+        28 => "ENOSPC",
+        30 => "EROFS",
+        31 => "EMLINK",
+        36 => "ENAMETOOLONG",
+        38 => "ENOSYS",
+        39 => "ENOTEMPTY",
+        40 => "ELOOP",
+        75 => "EOVERFLOW",
+        95 => "EOPNOTSUPP",
+        116 => "ESTALE",
+        _ => return format!("ERRNO_{errno}"),
+    };
+    name.to_string()
+}
+
 fn resolve_filesystem_path(
     raw_path: &str,
     dirfd: u64,
+    recorded_base: Option<&Value>,
     trace_analysis: &TraceAnalysis,
 ) -> Option<PathBuf> {
     let path = Path::new(raw_path);
     if path.is_absolute() {
         return Some(normalize_path(path));
     }
-    if dirfd == AT_FDCWD {
-        // An AT_FDCWD path depends on the worker's current directory. The trace
-        // does not record that directory, so do not guess an absolute path.
+    if let Some(base) = recorded_base {
+        // A null base means collection failed; do not substitute a stale fd mapping.
+        let base = Path::new(base.as_str()?);
+        return (base.is_absolute() && !raw_path.is_empty())
+            .then(|| normalize_path(&base.join(path)));
+    }
+    if dirfd as u32 == AT_FDCWD as u32 {
+        // Legacy traces lack the worker's current directory. Do not guess it.
         return None;
     }
     trace_analysis
@@ -598,67 +685,21 @@ fn is_covered(path: &Path, grants: &BTreeSet<PathBuf>) -> bool {
 fn render_profile(
     worker: &str,
     function_name: &str,
-    trace_files: &[PathBuf],
     trace_analysis: &TraceAnalysis,
     syscall_denylist: &[sandbox::DeniedSyscall],
 ) -> String {
-    // Include the observed accesses and omitted grants beside the generated
-    // policy so a reviewer can compare the policy with its trace evidence.
     let generated_denials = generated_syscall_denials(syscall_denylist, trace_analysis);
     let generated_network = trace_analysis.policy_network;
     let mut source = String::new();
-    writeln!(source, "// Copyright (c) Microsoft Corporation.").unwrap();
-    writeln!(source, "// Licensed under the MIT License.\n").unwrap();
     writeln!(
         source,
-        "//! Automatically generated sandbox profile for {worker}."
+        "// Automatically generated sandbox profile for {worker} worker\n"
     )
     .unwrap();
-    writeln!(source, "//!").unwrap();
-    writeln!(
-        source,
-        "//! Generated by sandbox_profiler from {} trace file(s).",
-        trace_files.len()
-    )
-    .unwrap();
-    write_comment_list(
-        &mut source,
-        "Observed filesystem accesses",
-        trace_analysis.observed_filesystem.iter().cloned(),
-    );
-    write_comment_list(
-        &mut source,
-        "Observed network accesses",
-        trace_analysis.observed_network.iter().cloned(),
-    );
-    write_comment_list(
-        &mut source,
-        "Observed syscalls",
-        trace_analysis.observed_syscalls.iter().cloned(),
-    );
-    write_comment_list(
-        &mut source,
-        "Filesystem policy access omissions",
-        trace_analysis
-            .policy_filesystem_access_omissions
-            .iter()
-            .cloned(),
-    );
-    write_comment_list(
-        &mut source,
-        "Syscalls denied by policy but used by the worker",
-        observed_policy_denials(syscall_denylist, trace_analysis),
-    );
-    writeln!(source).unwrap();
     writeln!(source, "use crate::Builder;").unwrap();
     writeln!(source, "use crate::Network;").unwrap();
     writeln!(source, "use crate::Profile;").unwrap();
     writeln!(source, "use crate::Syscalls;\n").unwrap();
-    writeln!(
-        source,
-        "/// Automatically generated profile from observed worker behavior."
-    )
-    .unwrap();
     writeln!(source, "pub fn {function_name}() -> Builder {{").unwrap();
     writeln!(source, "    Profile::deny_all()").unwrap();
     writeln!(source, "        .name({})", rust_string(function_name)).unwrap();
@@ -700,20 +741,53 @@ fn render_profile(
     source
 }
 
-fn write_comment_list(
-    output: &mut String,
-    heading: &str,
-    values: impl IntoIterator<Item = String>,
-) {
-    writeln!(output, "//!").unwrap();
-    writeln!(output, "//! {heading}:").unwrap();
+fn render_report(
+    worker: &str,
+    trace_files: &[PathBuf],
+    trace_analysis: &TraceAnalysis,
+    syscall_denylist: &[sandbox::DeniedSyscall],
+) -> String {
+    let mut report = String::new();
+    writeln!(report, "Sandbox profile report for {worker} worker").unwrap();
+    writeln!(
+        report,
+        "Generated by sandbox_profiler from {} trace file(s).",
+        trace_files.len()
+    )
+    .unwrap();
+    write_report_list(
+        &mut report,
+        "Observed filesystem accesses",
+        trace_analysis.observed_filesystem.iter().cloned(),
+    );
+    write_report_list(
+        &mut report,
+        "Observed network accesses",
+        trace_analysis.observed_network.iter().cloned(),
+    );
+    write_report_list(
+        &mut report,
+        "Observed syscalls",
+        trace_analysis.observed_syscalls.iter().cloned(),
+    );
+    write_report_list(
+        &mut report,
+        "Syscalls denied by policy but used by the worker",
+        observed_policy_denials(syscall_denylist, trace_analysis),
+    );
+    report
+}
+
+fn write_report_list(output: &mut String, heading: &str, values: impl IntoIterator<Item = String>) {
+    writeln!(output).unwrap();
+    writeln!(output, "{heading}:").unwrap();
     let mut any = false;
     for value in values {
         any = true;
-        writeln!(output, "//! - {value}").unwrap();
+        writeln!(output, "- {value}").unwrap();
     }
     if !any {
-        writeln!(output, "//! - None.").unwrap();
+        writeln!(output, "- None.").unwrap();
     }
 }
 
@@ -768,7 +842,7 @@ fn sanitize_rust_identifier(worker: &str) -> String {
 }
 
 fn format_dirfd(dirfd: u64) -> String {
-    if dirfd == AT_FDCWD {
+    if dirfd as u32 == AT_FDCWD as u32 {
         "AT_FDCWD".to_string()
     } else {
         dirfd.to_string()
@@ -817,6 +891,13 @@ mod tests {
                 "{\"event\":\"syscall\",\"syscall\":\"openat\",\"sys_nr\":257,",
                 "\"args\":[4294967196,1,524288,0,0,0],",
                 "\"decoded_args\":{\"path\":\"/sys/devices/system/cpu/online\"},\"result\":5}\n",
+                "{\"event\":\"syscall\",\"syscall\":\"openat\",\"args\":[4294967196,1,2,0,0,0],",
+                "\"decoded_args\":{\"path\":\"/denied/state/data\"},\"result\":-1,\"errno\":13}\n",
+                "{\"event\":\"syscall\",\"syscall\":\"openat\",\"args\":[4294967196,1,0,0,0,0],",
+                "\"decoded_args\":{\"path\":\"/usr/lib/libexample.so\"},\"result\":-2}\n",
+                "{\"event\":\"syscall\",\"syscall\":\"newfstatat\",\"args\":[3,1,0,4096,0,0],",
+                "\"decoded_args\":{\"path\":\"\",\"path_base\":null,",
+                "\"path_target\":\"/moved/libexample.so\"},\"result\":0}\n",
                 "{\"event\":\"syscall\",\"syscall\":\"socket\",\"sys_nr\":41,",
                 "\"args\":[2,1,0,0,0,0],\"decoded_args\":null,\"result\":4}\n",
                 "{\"event\":\"syscall\",\"syscall\":\"connect\",\"sys_nr\":42,",
@@ -851,8 +932,11 @@ mod tests {
         assert_eq!(
             trace_report.observed_filesystem,
             vec![
-                "/sys/devices/system/cpu/online (RO)",
-                "/usr/lib/libexample.so (RO)",
+                "/denied/state/data, RW, EACCES",
+                "/moved/libexample.so, RO, SUCCESS",
+                "/sys/devices/system/cpu/online, RO, SUCCESS",
+                "/usr/lib/libexample.so, RO, ENOENT",
+                "/usr/lib/libexample.so, RO, SUCCESS",
             ]
         );
         assert_eq!(
@@ -864,23 +948,43 @@ mod tests {
         assert!(generated.contains(".read(\"/sys/devices/system/cpu\")"));
         assert!(generated.contains(".read_exec(\"/usr/lib\")"));
         assert!(generated.contains(".network(Network::Loopback)"));
-        assert!(generated.contains("Observed filesystem accesses"));
-        assert!(generated.contains("Observed network accesses"));
-        assert!(generated.contains("Observed syscalls"));
-        assert!(
-            generated.contains("Syscalls denied by policy but used by the worker:\n//! - keyctl")
+        assert!(generated.starts_with(
+            "// Automatically generated sandbox profile for vm worker\n\nuse crate::Builder;"
+        ));
+        assert_eq!(
+            generated
+                .lines()
+                .filter(|line| line.starts_with("//"))
+                .count(),
+            1
         );
-        assert!(!generated.contains("Configured syscall denial list"));
-        assert!(!generated.contains("Generated syscall denial list"));
+        assert!(!generated.contains("Observed filesystem accesses"));
+        assert!(trace_report.log_path.ends_with("vm_worker.log"));
+        let log = fs_err::read_to_string(trace_report.log_path).unwrap();
+        assert!(log.contains("Generated by sandbox_profiler from 1 trace file(s)."));
+        assert!(log.contains("Observed filesystem accesses"));
+        assert!(log.contains("Observed network accesses"));
+        assert!(log.contains("Observed syscalls"));
+        assert!(!log.contains("Filesystem policy access omissions"));
+        assert!(log.contains("/denied/state/data, RW, EACCES"));
+        assert!(log.contains("/usr/lib/libexample.so, RO, ENOENT"));
+        assert!(log.contains("/usr/lib/libexample.so, RO, SUCCESS"));
+        assert!(log.contains("/moved/libexample.so, RO, SUCCESS"));
+        assert!(!log.contains("did not succeed"));
+        assert!(!log.contains("(RO|"));
+        assert!(log.contains("Syscalls denied by policy but used by the worker:\n- keyctl"));
+        assert!(!log.contains("Configured syscall denial list"));
+        assert!(!log.contains("Generated syscall denial list"));
         assert!(generated.contains("Syscalls::deny([\n"));
         assert!(generated.contains(".name(\"vm_worker\")"));
-        assert!(!generated.contains("//! - read\n"));
-        assert!(!generated.contains("unknown(999)"));
+        assert!(!log.contains("- read\n"));
+        assert!(!log.contains("unknown(999)"));
         assert_eq!(
             trace_report.observed_syscalls,
             vec![
                 "connect".to_string(),
                 "keyctl".to_string(),
+                "newfstatat".to_string(),
                 "openat".to_string(),
                 "socket".to_string()
             ]
@@ -936,14 +1040,18 @@ mod tests {
             "openat",
             [AT_FDCWD, 0, O_RDWR | O_CREAT, 0, 0, 0],
             "/var/lib/openvmm/state",
+            PathMetadata::default(),
             Some(5),
+            None,
             &mut trace_analysis,
         );
         observe_path(
             "newfstatat",
             [AT_FDCWD, 0, 0, 0, 0, 0],
             "/proc/self/maps",
+            PathMetadata::default(),
             Some(0),
+            None,
             &mut trace_analysis,
         );
         normalize_grants(&mut trace_analysis);
@@ -956,15 +1064,9 @@ mod tests {
         assert_eq!(
             trace_analysis.observed_filesystem,
             BTreeSet::from([
-                "/proc/self/maps (RO)".to_string(),
-                "/var/lib/openvmm/state (RW)".to_string(),
+                "/proc/self/maps, RO, SUCCESS".to_string(),
+                "/var/lib/openvmm/state, RW, SUCCESS".to_string(),
             ])
-        );
-        assert!(
-            trace_analysis
-                .policy_filesystem_access_omissions
-                .iter()
-                .any(|note| note.contains("implicit /proc"))
         );
     }
 
@@ -975,7 +1077,9 @@ mod tests {
             "openat",
             [AT_FDCWD, 0, 0, 0, 0, 0],
             "/var/lib/openvmm",
+            PathMetadata::default(),
             Some(5),
+            None,
             &mut trace_analysis,
         );
         observe_fd_lifecycle("dup", [5, 0, 0, 0, 0, 0], Some(8), &mut trace_analysis);
@@ -985,7 +1089,9 @@ mod tests {
             "openat",
             [12, 0, O_RDWR, 0, 0, 0],
             "state/../state/data",
+            PathMetadata::default(),
             Some(9),
+            None,
             &mut trace_analysis,
         );
 
@@ -1008,7 +1114,7 @@ mod tests {
         assert!(
             trace_analysis
                 .observed_filesystem
-                .contains("/var/lib/openvmm/state/data (RW)")
+                .contains("/var/lib/openvmm/state/data, RW, SUCCESS")
         );
         assert!(
             trace_analysis
@@ -1021,17 +1127,300 @@ mod tests {
             "newfstatat",
             [12, 0, 0, 0, 0, 0],
             "unresolved",
+            PathMetadata::default(),
             Some(-1),
+            None,
             &mut trace_analysis,
         );
 
         assert!(!trace_analysis.filesystem_fd_paths.contains_key(&12));
         assert!(
             trace_analysis
-                .policy_filesystem_access_omissions
-                .iter()
-                .any(|omission| omission.contains("dirfd: 12"))
+                .observed_filesystem
+                .contains("unresolved, RO, EPERM")
         );
+    }
+
+    #[test]
+    fn resolves_recorded_bases_for_relative_paths() {
+        let trace_analysis = analyze_events(&[
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {
+                    "path": "glibc-hwcaps/x86-64-v2/libgcc_s.so.1",
+                    "path_base": "/work"
+                }
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [7, 0, 0, 0, 0, 0], "result": 8,
+                "decoded_args": {"path": "plugin.so", "path_base": "/opt/libs"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 9,
+                "decoded_args": {"path": "settings", "path_base": "/next/config"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "renameat2",
+                "args": [7, 0, 10, 0, 0, 0], "result": 0,
+                "decoded_args": {
+                    "path": "items/old", "path_base": "/source",
+                    "path2": "items/new", "path2_base": "/destination"
+                }
+            }),
+        ]);
+
+        assert_eq!(
+            trace_analysis.observed_filesystem,
+            BTreeSet::from([
+                "/work/glibc-hwcaps/x86-64-v2/libgcc_s.so.1, RO, ENOENT".to_string(),
+                "/opt/libs/plugin.so, RO, SUCCESS".to_string(),
+                "/next/config/settings, RO, SUCCESS".to_string(),
+                "/source/items/old, RW, SUCCESS".to_string(),
+                "/destination/items/new, RW, SUCCESS".to_string(),
+            ])
+        );
+        assert_eq!(
+            trace_analysis.policy_read_paths,
+            BTreeSet::from([PathBuf::from("/opt/libs"), PathBuf::from("/next/config"),])
+        );
+        assert_eq!(
+            trace_analysis.policy_read_write_paths,
+            BTreeSet::from([
+                PathBuf::from("/source/items"),
+                PathBuf::from("/destination/items"),
+            ])
+        );
+    }
+
+    #[test]
+    fn failed_filesystem_accesses_are_observed_without_grants() {
+        let trace_analysis = analyze_events(&[
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "/missing/libraries/libexample.so"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, O_RDWR | O_CREAT, 0, 0, 0], "result": -13,
+                "decoded_args": {"path": "/denied/state/data"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "mkdirat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -17,
+                "decoded_args": {"path": "/existing/directory"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "unlinkat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "/missing/state/data"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "renameat2",
+                "args": [AT_FDCWD, 0, AT_FDCWD, 0, 0, 0], "result": -2,
+                "decoded_args": {
+                    "path": "/missing/source/old", "path2": "/missing/destination/new"
+                }
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "statx",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0],
+                "decoded_args": {"path": "/unknown/result/file"}
+            }),
+        ]);
+
+        assert_eq!(
+            trace_analysis.observed_filesystem,
+            BTreeSet::from([
+                "/missing/libraries/libexample.so, RO, ENOENT".to_string(),
+                "/denied/state/data, RW, EACCES".to_string(),
+                "/existing/directory, RW, EEXIST".to_string(),
+                "/missing/state/data, RW, ENOENT".to_string(),
+                "/missing/source/old, RW, ENOENT".to_string(),
+                "/missing/destination/new, RW, ENOENT".to_string(),
+                "/unknown/result/file, RO, UNKNOWN".to_string(),
+            ])
+        );
+        assert!(trace_analysis.policy_read_paths.is_empty());
+        assert!(trace_analysis.policy_read_write_paths.is_empty());
+        assert!(trace_analysis.filesystem_fd_paths.is_empty());
+    }
+
+    #[test]
+    fn successful_access_grants_only_its_observed_permissions() {
+        let mut trace_analysis = TraceAnalysis::default();
+        observe_path(
+            "openat",
+            [AT_FDCWD, 0, O_RDWR | O_CREAT, 0, 0, 0],
+            "/var/lib/openvmm/state",
+            PathMetadata::default(),
+            Some(-13),
+            None,
+            &mut trace_analysis,
+        );
+        observe_path(
+            "openat",
+            [AT_FDCWD, 0, 0, 0, 0, 0],
+            "/var/lib/openvmm/state",
+            PathMetadata::default(),
+            Some(0),
+            None,
+            &mut trace_analysis,
+        );
+
+        assert_eq!(
+            trace_analysis.policy_read_paths,
+            BTreeSet::from([PathBuf::from("/var/lib/openvmm")])
+        );
+        assert!(trace_analysis.policy_read_write_paths.is_empty());
+        assert_eq!(
+            trace_analysis.filesystem_fd_paths.get(&0),
+            Some(&PathBuf::from("/var/lib/openvmm/state"))
+        );
+    }
+
+    #[test]
+    fn recorded_bases_override_legacy_fd_tracking() {
+        let mut events = vec![
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 8,
+                "decoded_args": {"path": "/stale/base"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [8, 0, 0, 0, 0, 0], "result": 9,
+                "decoded_args": {"path": "file", "path_base": "/moved/base"}
+            }),
+        ];
+        for base in [
+            Value::Null,
+            serde_json::json!("relative"),
+            serde_json::json!(42),
+        ] {
+            events.push(serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [8, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "unresolved", "path_base": base}
+            }));
+        }
+        events.push(serde_json::json!({
+            "event": "syscall", "syscall": "statx",
+            "args": [8, 0, 0, 0, 0, 0], "result": 0,
+            "decoded_args": {"path": "", "path_base": "/stale/base"}
+        }));
+        let trace_analysis = analyze_events(&events);
+
+        assert_eq!(
+            trace_analysis.observed_filesystem,
+            BTreeSet::from([
+                "<empty pathname; statx; dirfd: 8>, RO, SUCCESS".to_string(),
+                "/stale/base, RO, SUCCESS".to_string(),
+                "/moved/base/file, RO, SUCCESS".to_string(),
+                "unresolved, RO, ENOENT".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn records_empty_path_accesses_without_pathname_grants() {
+        let trace_analysis = analyze_events(&[
+            serde_json::json!({
+                "event": "syscall", "syscall": "newfstatat",
+                "args": [4, 0, 0, 4096, 0, 0], "result": 0,
+                "decoded_args": {"path": "", "path_base": null}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "statx",
+                "args": [8, 0, 4096, 0, 0, 0], "result": 0,
+                "decoded_args": {"path": ""}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [u64::MAX - 99, 0, O_RDWR, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "", "path_base": null}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "newfstatat",
+                "args": [9, 0, 0, 4096, 0, 0],
+                "decoded_args": {"path": ""}
+            }),
+        ]);
+
+        assert_eq!(
+            trace_analysis.observed_filesystem,
+            BTreeSet::from([
+                "<empty pathname; newfstatat; dirfd: 4>, RO, SUCCESS".to_string(),
+                "<empty pathname; newfstatat; dirfd: 9>, RO, UNKNOWN".to_string(),
+                "<empty pathname; openat; dirfd: AT_FDCWD>, RW, ENOENT".to_string(),
+                "<empty pathname; statx; dirfd: 8>, RO, SUCCESS".to_string(),
+            ])
+        );
+        assert!(trace_analysis.policy_read_paths.is_empty());
+        assert!(trace_analysis.policy_read_write_paths.is_empty());
+        assert!(trace_analysis.filesystem_fd_paths.is_empty());
+    }
+
+    #[test]
+    fn observes_recorded_descriptor_targets_without_pathname_grants() {
+        let mut events = Vec::new();
+        for target in [
+            "/inherited/file",
+            "/work",
+            "anon_inode:[eventpoll]",
+            "/removed/file (deleted)",
+        ] {
+            events.push(serde_json::json!({
+                "event": "syscall", "syscall": "statx",
+                "args": [AT_FDCWD, 0, 4096, 0, 0, 0], "result": 0,
+                "decoded_args": {
+                    "path": "", "path_base": null, "path_target": target
+                }
+            }));
+        }
+        events.push(serde_json::json!({
+            "event": "syscall", "syscall": "newfstatat",
+            "args": [7, 0, 0, 4096, 0, 0], "result": -13, "errno": 13,
+            "decoded_args": {"path": "", "path_target": "/denied/file"}
+        }));
+        for target in [Value::Null, serde_json::json!(42), serde_json::json!("")] {
+            events.push(serde_json::json!({
+                "event": "syscall", "syscall": "statx",
+                "args": [8, 0, 4096, 0, 0, 0], "result": 0,
+                "decoded_args": {"path": "", "path_target": target}
+            }));
+        }
+        let trace_analysis = analyze_events(&events);
+        assert_eq!(
+            trace_analysis.observed_filesystem,
+            BTreeSet::from([
+                "/inherited/file, RO, SUCCESS".to_string(),
+                "/work, RO, SUCCESS".to_string(),
+                "anon_inode:[eventpoll], RO, SUCCESS".to_string(),
+                "/removed/file (deleted), RO, SUCCESS".to_string(),
+                "/denied/file, RO, EACCES".to_string(),
+                "<empty pathname; statx; dirfd: 8>, RO, SUCCESS".to_string(),
+            ])
+        );
+        assert!(trace_analysis.policy_read_paths.is_empty());
+        assert!(trace_analysis.policy_read_write_paths.is_empty());
+        assert!(trace_analysis.filesystem_fd_paths.is_empty());
+    }
+
+    fn analyze_events(events: &[Value]) -> TraceAnalysis {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("trace.jsonl");
+        let contents = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        fs_err::write(&path, contents).unwrap();
+        let mut trace_analysis = TraceAnalysis::default();
+        ingest_trace(&path, &[], &mut trace_analysis).unwrap();
+        trace_analysis
     }
 
     #[test]
