@@ -24,6 +24,8 @@ const O_RDWR: u64 = 0o2;
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
+#[cfg(test)]
+const O_PATH: u64 = 0o10_000_000;
 const O_TMPFILE: u64 = 0o20_200_000;
 const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
@@ -37,7 +39,7 @@ pub struct TraceOptions {
     /// Worker name used to select trace files and name the generated profile.
     pub worker: String,
     /// Directory where the generated Rust source and report are written.
-    pub output_dir: PathBuf,
+    pub profile_dir: PathBuf,
 }
 
 /// Summary of a generated profile.
@@ -57,10 +59,14 @@ pub struct TraceReport {
     /// Syscall names observed in the trace.
     pub observed_syscalls: Vec<String>,
 
-    /// Read-only directory grants emitted, with execute access outside sysfs.
+    /// Read candidates, classified using captured modes when available.
     pub policy_read_paths: Vec<PathBuf>,
-    /// Read-write directory grants emitted.
+    /// Exact read-write paths emitted.
     pub policy_read_write_paths: Vec<PathBuf>,
+    /// Exact device grants, including unknown paths under `/dev`.
+    pub policy_device_paths: Vec<PathBuf>,
+    /// One read/execute grant for "." when accesses use the startup-CWD anchor.
+    pub policy_cwd: FilesystemGrants,
     /// Network policy generated from the trace.
     pub policy_network: sandbox::Network,
     /// Default syscall denials that were not observed and were emitted.
@@ -76,17 +82,44 @@ struct TraceAnalysis {
     observed_syscalls: BTreeSet<String>,
 
     filesystem_fd_paths: BTreeMap<i64, PathBuf>,
+    filesystem_cwd_fd_paths: BTreeMap<i64, PathBuf>,
     network_fd_scopes: BTreeMap<i64, sandbox::Network>,
 
-    policy_read_paths: BTreeSet<PathBuf>,
-    policy_read_write_paths: BTreeSet<PathBuf>,
+    absolute_grants: FilesystemGrants,
+    cwd_grants: FilesystemGrants,
+    initial_cwd: Option<PathBuf>,
+    cwd_recorded: bool,
+    unportable_paths: BTreeSet<String>,
     policy_network: sandbox::Network,
+}
+
+/// Filesystem grants sharing a single absolute or worker-CWD-relative anchor.
+#[derive(Debug, Default)]
+pub struct FilesystemGrants {
+    /// Read-only paths.
+    pub policy_read_paths: BTreeSet<PathBuf>,
+    /// Read-write paths.
+    pub policy_read_write_paths: BTreeSet<PathBuf>,
+    /// Device-I/O paths.
+    pub policy_device_paths: BTreeSet<PathBuf>,
+    file_execution: BTreeMap<PathBuf, bool>,
+    non_exec_paths: BTreeSet<PathBuf>,
+}
+
+impl FilesystemGrants {
+    fn is_empty(&self) -> bool {
+        self.policy_read_paths.is_empty()
+            && self.policy_read_write_paths.is_empty()
+            && self.policy_device_paths.is_empty()
+    }
 }
 
 #[derive(Default)]
 struct PathMetadata<'a> {
     base: Option<&'a Value>,
     target: Option<&'a Value>,
+    opened_file: Option<&'a Value>,
+    stat_file: Option<&'a Value>,
 }
 
 /// Generate a sandbox profile template from the worker trace.
@@ -122,11 +155,21 @@ pub fn build_profile(trace_options: &TraceOptions) -> anyhow::Result<TraceReport
     for path in &trace_files {
         ingest_trace(path, &default_syscall_denials, &mut trace_analysis)?;
     }
+    ensure!(
+        trace_analysis.unportable_paths.is_empty(),
+        "cannot generate portable relative grants:\n{}",
+        trace_analysis
+            .unportable_paths
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     normalize_grants(&mut trace_analysis);
 
-    fs_err::create_dir_all(&trace_options.output_dir)
-        .with_context(|| format!("failed to create {}", trace_options.output_dir.display()))?;
-    let profile_path = trace_options.output_dir.join(format!("{module_name}.rs"));
+    fs_err::create_dir_all(&trace_options.profile_dir)
+        .with_context(|| format!("failed to create {}", trace_options.profile_dir.display()))?;
+    let profile_path = trace_options.profile_dir.join(format!("{module_name}.rs"));
     let source = render_profile(
         &worker_file_name,
         &module_name,
@@ -136,7 +179,7 @@ pub fn build_profile(trace_options: &TraceOptions) -> anyhow::Result<TraceReport
     fs_err::write(&profile_path, source)
         .with_context(|| format!("failed to write {}", profile_path.display()))?;
     let log_path = trace_options
-        .output_dir
+        .profile_dir
         .join(format!("{worker_file_name}_worker.log"));
     let log = render_report(
         &worker_file_name,
@@ -156,10 +199,24 @@ pub fn build_profile(trace_options: &TraceOptions) -> anyhow::Result<TraceReport
         observed_filesystem: trace_analysis.observed_filesystem.into_iter().collect(),
         observed_network: trace_analysis.observed_network.into_iter().collect(),
         observed_syscalls: trace_analysis.observed_syscalls.into_iter().collect(),
-        policy_read_paths: trace_analysis.policy_read_paths.into_iter().collect(),
-        policy_read_write_paths: trace_analysis.policy_read_write_paths.into_iter().collect(),
+        policy_read_paths: trace_analysis
+            .absolute_grants
+            .policy_read_paths
+            .into_iter()
+            .collect(),
+        policy_read_write_paths: trace_analysis
+            .absolute_grants
+            .policy_read_write_paths
+            .into_iter()
+            .collect(),
+        policy_device_paths: trace_analysis
+            .absolute_grants
+            .policy_device_paths
+            .into_iter()
+            .collect(),
         policy_network,
         policy_syscalls,
+        policy_cwd: trace_analysis.cwd_grants,
     })
 }
 
@@ -205,7 +262,10 @@ fn ingest_trace(
     // Each trace is a separate worker run. An fd number in the next trace does
     // not refer to the resource tracked under that number in this trace.
     trace_analysis.filesystem_fd_paths.clear();
+    trace_analysis.filesystem_cwd_fd_paths.clear();
     trace_analysis.network_fd_scopes.clear();
+    trace_analysis.initial_cwd = None;
+    trace_analysis.cwd_recorded = false;
     let file = fs_err::File::open(path)
         .with_context(|| format!("failed to open trace {}", path.display()))?;
     for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
@@ -213,6 +273,13 @@ fn ingest_trace(
             line.with_context(|| format!("failed to read {}:{}", path.display(), index + 1))?;
         let event: Value = serde_json::from_str(&line)
             .with_context(|| format!("invalid JSON at {}:{}", path.display(), index + 1))?;
+        if event["event"] == "trace_started" {
+            trace_analysis.cwd_recorded = event.get("cwd").is_some();
+            trace_analysis.initial_cwd = event["cwd"]
+                .as_str()
+                .filter(|cwd| Path::new(cwd).is_absolute() && !cwd.ends_with(" (deleted)"))
+                .map(PathBuf::from);
+        }
         if event["event"] != "syscall" {
             continue;
         }
@@ -232,9 +299,14 @@ fn ingest_trace(
         observe_fd_lifecycle(syscall, args, result, trace_analysis);
         observe_network(syscall, args, result, errno, decoded, trace_analysis);
 
+        let opened_file = (syscall == "openat")
+            .then(|| event.get("opened_file"))
+            .flatten();
+        let stat_file = event.get("path_metadata");
         if let Some(path) = decoded
             .and_then(|decoded| decoded.get("path"))
             .and_then(Value::as_str)
+            .or_else(|| opened_file.and_then(|file| file["path"].as_str()))
         {
             observe_path(
                 syscall,
@@ -243,6 +315,8 @@ fn ingest_trace(
                 PathMetadata {
                     base: decoded.and_then(|decoded| decoded.get("path_base")),
                     target: decoded.and_then(|decoded| decoded.get("path_target")),
+                    opened_file,
+                    stat_file,
                 },
                 result,
                 errno,
@@ -262,6 +336,8 @@ fn ingest_trace(
                 PathMetadata {
                     base: decoded.and_then(|decoded| decoded.get("path2_base")),
                     target: None,
+                    opened_file: None,
+                    stat_file: event.get("path2_metadata"),
                 },
                 result,
                 errno,
@@ -313,6 +389,7 @@ fn observe_path(
         return;
     }
     let Some(path) = resolve_filesystem_path(raw_path, args[0], metadata.base, trace_analysis)
+        .or_else(|| recorded_open_path(metadata.opened_file))
     else {
         trace_analysis
             .observed_filesystem
@@ -324,35 +401,143 @@ fn observe_path(
         .observed_filesystem
         .insert(format!("{}, {access}, {outcome}", path.display()));
 
-    let Some(result) = result.filter(|result| *result >= 0) else {
-        return;
-    };
-
-    if syscall == "openat" {
+    if syscall == "openat"
+        && let Some(fd) = result.filter(|result| *result >= 0)
+    {
         // Remember the returned path so a later relative *at call using this
         // fd can be resolved to an absolute path.
-        trace_analysis
-            .filesystem_fd_paths
-            .insert(result, path.clone());
+        trace_analysis.filesystem_fd_paths.insert(
+            fd,
+            recorded_open_path(metadata.opened_file).unwrap_or_else(|| path.clone()),
+        );
+        trace_analysis.filesystem_cwd_fd_paths.remove(&fd);
     }
 
     // The sandbox creates its own /proc and /tmp mounts. Granting the host
     // versions would give the worker different access from what it requested.
-    if path.starts_with("/proc") || path.starts_with("/tmp") {
+    // A root-wide grant would expose the entire host filesystem.
+    if path == Path::new("/") || path.starts_with("/proc") || path.starts_with("/tmp") {
         return;
     }
 
-    let grant_path = directory_grant(&path);
-    // Granting / would expose the entire host filesystem.
-    if grant_path == Path::new("/") {
+    let captured_metadata = result.filter(|result| *result >= 0).and_then(|_| {
+        metadata
+            .opened_file
+            .filter(|file| file.is_object())
+            .or(metadata.stat_file)
+    });
+    let file_type = captured_metadata.and_then(|file| file["file_type"].as_str());
+    let is_device = match file_type {
+        Some("character_device" | "block_device") => true,
+        Some("regular_file" | "directory" | "symlink" | "fifo" | "socket") => false,
+        _ => path.starts_with("/dev") && path != Path::new("/dev"),
+    };
+
+    let (path, cwd_relative) =
+        match portable_grant_path(raw_path, args[0], metadata.base, &path, trace_analysis) {
+            Ok(path) => path,
+            Err(reason) => {
+                trace_analysis.unportable_paths.insert(reason);
+                return;
+            }
+        };
+    if syscall == "openat"
+        && cwd_relative
+        && let Some(fd) = result.filter(|fd| *fd >= 0)
+    {
+        trace_analysis
+            .filesystem_cwd_fd_paths
+            .insert(fd, path.clone());
+    }
+    let grants = if cwd_relative {
+        &mut trace_analysis.cwd_grants
+    } else {
+        &mut trace_analysis.absolute_grants
+    };
+
+    if is_device {
+        grants.policy_device_paths.insert(path);
         return;
+    }
+    if file_type == Some("regular_file")
+        && let Some(mode) = captured_metadata.and_then(|file| file["mode"].as_u64())
+    {
+        // Keep execution if any successful snapshot observed execute bits.
+        *grants.file_execution.entry(path.clone()).or_default() |= mode & 0o111 != 0;
+    }
+
+    fn recorded_open_path(opened_file: Option<&Value>) -> Option<PathBuf> {
+        let path = opened_file?.get("path")?.as_str()?;
+        (Path::new(path).is_absolute() && !path.ends_with(" (deleted)"))
+            .then(|| normalize_path(Path::new(path)))
     }
 
     if is_write {
-        trace_analysis.policy_read_write_paths.insert(grant_path);
+        grants.policy_read_write_paths.insert(path);
     } else {
-        trace_analysis.policy_read_paths.insert(grant_path);
+        grants.policy_read_paths.insert(path);
     }
+}
+
+// Preserve the relative suffix, including symlink-sensitive `..`, rather than
+// baking the captured container directory into generated policy. Directory-FD
+// lookups inherit a portable anchor only from a successfully opened relative fd.
+fn portable_grant_path(
+    raw_path: &str,
+    dirfd: u64,
+    recorded_base: Option<&Value>,
+    absolute_path: &Path,
+    trace_analysis: &mut TraceAnalysis,
+) -> Result<(PathBuf, bool), String> {
+    if Path::new(raw_path).is_absolute() {
+        return Ok((absolute_path.to_path_buf(), false));
+    }
+    let base = recorded_base
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|base| base.is_absolute() && !base.to_string_lossy().ends_with(" (deleted)"))
+        .or_else(|| {
+            recorded_base
+                .is_none()
+                .then(|| {
+                    trace_analysis
+                        .filesystem_fd_paths
+                        .get(&(dirfd as i64))
+                        .cloned()
+                })
+                .flatten()
+        });
+    let is_cwd = dirfd as u32 == AT_FDCWD as u32;
+    if is_cwd && !trace_analysis.cwd_recorded && trace_analysis.initial_cwd.is_none() {
+        trace_analysis.initial_cwd = base.clone();
+    }
+    let tracked_relative = trace_analysis.filesystem_cwd_fd_paths.get(&(dirfd as i64));
+    if !is_cwd {
+        let Some(relative) = tracked_relative else {
+            return Ok((absolute_path.to_path_buf(), false));
+        };
+        if base.as_ref() == trace_analysis.filesystem_fd_paths.get(&(dirfd as i64)) {
+            let relative = relative
+                .join(raw_path)
+                .components()
+                .filter(|component| *component != Component::CurDir)
+                .collect();
+            return Ok((relative, true));
+        }
+    }
+    if let (Some(base), Some(initial)) = (&base, &trace_analysis.initial_cwd)
+        && let Ok(suffix) = base.strip_prefix(initial)
+    {
+        let relative = suffix
+            .join(raw_path)
+            .components()
+            .filter(|component| *component != Component::CurDir)
+            .collect();
+        return Ok((relative, true));
+    }
+    Err(format!(
+        "relative path {raw_path:?} has no portable startup-CWD anchor (lookup root: {base:?})"
+    ))
 }
 
 fn access_outcome(result: Option<i64>, errno: Option<i64>) -> String {
@@ -444,16 +629,6 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
-}
-
-fn directory_grant(path: &Path) -> PathBuf {
-    // The sandbox grants directory trees, so an accessed file becomes a grant
-    // for its parent directory.
-    if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent().unwrap_or(Path::new("/")).to_path_buf()
-    }
 }
 
 fn path_is_written(syscall: &str, args: [u64; 6]) -> bool {
@@ -593,6 +768,7 @@ fn observe_fd_lifecycle(
         "close" if result == Some(0) => {
             let fd = args[0] as i64;
             trace_analysis.filesystem_fd_paths.remove(&fd);
+            trace_analysis.filesystem_cwd_fd_paths.remove(&fd);
             trace_analysis.network_fd_scopes.remove(&fd);
         }
         _ => {}
@@ -606,6 +782,15 @@ fn copy_tracked_fd(source: u64, destination: Option<i64>, trace_analysis: &mut T
     let source = source as i64;
     if let Some(path) = trace_analysis.filesystem_fd_paths.get(&source).cloned() {
         trace_analysis.filesystem_fd_paths.insert(destination, path);
+    } else {
+        trace_analysis.filesystem_fd_paths.remove(&destination);
+    }
+    if let Some(path) = trace_analysis.filesystem_cwd_fd_paths.get(&source).cloned() {
+        trace_analysis
+            .filesystem_cwd_fd_paths
+            .insert(destination, path);
+    } else {
+        trace_analysis.filesystem_cwd_fd_paths.remove(&destination);
     }
     if let Some(scope) = trace_analysis.network_fd_scopes.get(&source).copied() {
         trace_analysis.network_fd_scopes.insert(destination, scope);
@@ -658,14 +843,71 @@ fn widen_network_fd(fd: i64, scope: sandbox::Network, trace_analysis: &mut Trace
 }
 
 fn normalize_grants(trace_analysis: &mut TraceAnalysis) {
-    // Remove grants already covered by a broader grant. Read-write covers
-    // read-only, and a parent directory covers its child directories.
-    trace_analysis
+    minimize_filesystem_grants(&mut trace_analysis.absolute_grants);
+    // Keep device exceptions when widening ordinary CWD-anchored observations.
+    if !trace_analysis.cwd_grants.is_empty() {
+        let device_paths = std::mem::take(&mut trace_analysis.cwd_grants.policy_device_paths);
+        trace_analysis.cwd_grants = FilesystemGrants {
+            policy_read_paths: BTreeSet::from([PathBuf::from(".")]),
+            policy_device_paths: device_paths,
+            ..Default::default()
+        };
+    }
+}
+
+/// Minimize a complete, single-anchor grant set without inventing ancestors.
+/// Processing all observations before pruning makes syscall order irrelevant.
+/// Observed RW ancestors cover RO descendants; RO ancestors retain RW exceptions.
+/// Ordinary mounts never subsume device I/O. Paths containing `..` are only
+/// deduplicated exactly, because lexical ancestry can disagree with symlink lookup.
+fn minimize_filesystem_grants(grants: &mut FilesystemGrants) {
+    let restricted_files = grants
+        .file_execution
+        .iter()
+        .filter(|(_, executable)| !**executable)
+        .map(|(path, _)| path);
+    grants.non_exec_paths.extend(
+        grants
+            .policy_read_paths
+            .iter()
+            .filter(|path| {
+                grants
+                    .policy_read_write_paths
+                    .iter()
+                    .chain(&grants.policy_device_paths)
+                    .chain(restricted_files.clone())
+                    .any(|restricted| restricted.starts_with(path))
+            })
+            .cloned(),
+    );
+    grants
+        .policy_read_write_paths
+        .retain(|path| !grants.policy_device_paths.contains(path));
+    // Deduplicate permissions and descendants of independently observed ancestors.
+    grants.policy_read_paths.retain(|path| {
+        !is_covered(path, &grants.policy_read_write_paths)
+            && !grants.policy_device_paths.contains(path)
+    });
+    let (executable, read_only): (BTreeSet<_>, BTreeSet<_>) = grants
         .policy_read_paths
-        .retain(|path| !is_covered(path, &trace_analysis.policy_read_write_paths));
-    trace_analysis.policy_read_paths = collapse_paths(&trace_analysis.policy_read_paths);
-    trace_analysis.policy_read_write_paths =
-        collapse_paths(&trace_analysis.policy_read_write_paths);
+        .iter()
+        .cloned()
+        .partition(|path| read_is_executable(grants, path));
+    grants.policy_read_paths = collapse_paths(&read_only);
+    grants.policy_read_paths.extend(collapse_paths(&executable));
+    grants.policy_read_write_paths = collapse_paths(&grants.policy_read_write_paths);
+}
+
+fn read_is_executable(grants: &FilesystemGrants, path: &Path) -> bool {
+    if path.starts_with("/sys") || grants.non_exec_paths.contains(path) {
+        return false;
+    }
+    grants.file_execution.get(path).copied().unwrap_or_else(|| {
+        !grants
+            .non_exec_paths
+            .iter()
+            .any(|parent| path.starts_with(parent))
+    })
 }
 
 fn collapse_paths(paths: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
@@ -679,7 +921,14 @@ fn collapse_paths(paths: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
 }
 
 fn is_covered(path: &Path, grants: &BTreeSet<PathBuf>) -> bool {
-    grants.iter().any(|grant| path.starts_with(grant))
+    grants.iter().any(|grant| {
+        path == grant
+            || (!path
+                .components()
+                .chain(grant.components())
+                .any(|component| component == Component::ParentDir)
+                && path.starts_with(grant))
+    })
 }
 
 fn render_profile(
@@ -700,45 +949,111 @@ fn render_profile(
     writeln!(source, "use crate::Network;").unwrap();
     writeln!(source, "use crate::Profile;").unwrap();
     writeln!(source, "use crate::Syscalls;\n").unwrap();
+    let has_cwd = !trace_analysis.cwd_grants.is_empty();
     writeln!(source, "pub fn {function_name}() -> Builder {{").unwrap();
-    writeln!(source, "    Profile::deny_all()").unwrap();
-    writeln!(source, "        .name({})", rust_string(function_name)).unwrap();
-    for path in &trace_analysis.policy_read_paths {
-        // Traces do not capture executable mappings. Keep execution available
-        // outside sysfs so that shared libraries remain loadable.
-        let method = if path.starts_with("/sys") {
+    writeln!(source, "    // Deny access by default.").unwrap();
+    writeln!(
+        source,
+        "    let mut profile = Profile::deny_all().name({});",
+        rust_string(function_name)
+    )
+    .unwrap();
+    if has_cwd {
+        writeln!(
+            source,
+            "    let cwd = std::env::current_dir().unwrap_or_default();"
+        )
+        .unwrap();
+    }
+    render_filesystem_grants(&mut source, trace_analysis);
+    writeln!(source, "\n    // System call restrictions.").unwrap();
+    writeln!(source, "    profile = profile.syscalls(Syscalls::deny([").unwrap();
+    for syscall in &generated_denials {
+        writeln!(source, "        {},", rust_string(syscall)).unwrap();
+    }
+    writeln!(source, "    ]));").unwrap();
+    writeln!(source, "\n    // Network access.").unwrap();
+    writeln!(
+        source,
+        "    profile = profile.network(Network::{});",
+        network_variant(generated_network),
+    )
+    .unwrap();
+    writeln!(source, "\n    profile").unwrap();
+    writeln!(source, "}}").unwrap();
+    source
+}
+
+// CWD-anchored observations share the first read/execute entry. A failed CWD
+// lookup or non-UTF-8 CWD produces an empty string, which the existence check skips.
+fn render_filesystem_grants(source: &mut String, trace_analysis: &TraceAnalysis) {
+    let mut groups: BTreeMap<&str, Vec<&Path>> = BTreeMap::new();
+    let grants = &trace_analysis.absolute_grants;
+    for path in &grants.policy_read_paths {
+        let method = if !read_is_executable(grants, path)
+            || grants
+                .policy_device_paths
+                .iter()
+                .chain(&grants.policy_read_write_paths)
+                .any(|restricted| restricted.starts_with(path))
+        {
             "read"
         } else {
             "read_exec"
         };
-        writeln!(
-            source,
-            "        .{method}({})",
-            rust_string(&path.display().to_string())
-        )
-        .unwrap();
+        groups.entry(method).or_default().push(path);
     }
-    for path in &trace_analysis.policy_read_write_paths {
-        writeln!(
-            source,
-            "        .read_write({})",
-            rust_string(&path.display().to_string())
-        )
-        .unwrap();
+    for (method, paths) in [
+        ("read_write", &grants.policy_read_write_paths),
+        ("device", &grants.policy_device_paths),
+    ] {
+        groups
+            .entry(method)
+            .or_default()
+            .extend(paths.iter().map(PathBuf::as_path));
     }
-    writeln!(source, "        .syscalls(Syscalls::deny([").unwrap();
-    for syscall in &generated_denials {
-        writeln!(source, "            {},", rust_string(syscall)).unwrap();
+    groups.entry("device").or_default().extend(
+        trace_analysis
+            .cwd_grants
+            .policy_device_paths
+            .iter()
+            .map(PathBuf::as_path),
+    );
+    for (method, comment) in [
+        ("read", "Read-only paths."),
+        ("read_exec", "Read and execute paths."),
+        ("read_write", "Read/write paths."),
+        ("device", "Device access."),
+    ] {
+        let paths = groups.get(method).map(Vec::as_slice).unwrap_or_default();
+        let include_cwd = method == "read_exec" && !trace_analysis.cwd_grants.is_empty();
+        if paths.is_empty() && !include_cwd {
+            continue;
+        }
+        writeln!(source, "\n    // {comment}").unwrap();
+        writeln!(source, "    for path in [").unwrap();
+        if include_cwd {
+            writeln!(
+                source,
+                "        cwd.to_str().unwrap_or_default(), // Allow read/execute access to the worker's working directory."
+            )
+            .unwrap();
+        }
+        for path in paths {
+            let path = rust_string(&path.display().to_string());
+            writeln!(source, "        {path},").unwrap();
+        }
+        writeln!(source, "    ] {{").unwrap();
+        writeln!(source, "        let path = std::path::Path::new(path);").unwrap();
+        if method == "device" && !trace_analysis.cwd_grants.policy_device_paths.is_empty() {
+            writeln!(source, "        let resolved_path = cwd.join(path);").unwrap();
+            writeln!(source, "        let path = resolved_path.as_path();").unwrap();
+        }
+        writeln!(source, "        if path.exists() {{").unwrap();
+        writeln!(source, "            profile = profile.{method}(path);").unwrap();
+        writeln!(source, "        }}").unwrap();
+        writeln!(source, "    }}").unwrap();
     }
-    writeln!(source, "        ]))").unwrap();
-    writeln!(
-        source,
-        "        .network(Network::{})",
-        network_variant(generated_network)
-    )
-    .unwrap();
-    writeln!(source, "}}").unwrap();
-    source
 }
 
 fn render_report(
@@ -877,6 +1192,134 @@ fn rust_string(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn has_generated_grant(source: &str, method: &str, path: &str) -> bool {
+        source.split("\n    for path in [\n").skip(1).any(|block| {
+            let (paths, body) = block.split_once("\n    ]").unwrap();
+            paths.lines().any(|line| line.contains(&rust_string(path)))
+                && body
+                    .split("\n    }\n")
+                    .next()
+                    .unwrap()
+                    .contains(&format!("profile = profile.{method}(path);"))
+        })
+    }
+
+    #[test]
+    fn folds_cwd_paths_into_first_read_exec_entry_and_returns_builder() {
+        let mut analysis = TraceAnalysis::default();
+        analysis.absolute_grants.policy_read_paths.extend([
+            PathBuf::from("/sys/example"),
+            PathBuf::from("/captured-only/library.so"),
+        ]);
+        analysis
+            .cwd_grants
+            .policy_read_paths
+            .insert(PathBuf::from("library.so"));
+        for (grants, prefix) in [
+            (&mut analysis.absolute_grants, "/captured-only/"),
+            (&mut analysis.cwd_grants, ""),
+        ] {
+            grants
+                .policy_read_write_paths
+                .insert(PathBuf::from(format!("{prefix}state")));
+            grants
+                .policy_device_paths
+                .insert(PathBuf::from(format!("{prefix}device")));
+        }
+        normalize_grants(&mut analysis);
+        assert_eq!(
+            analysis.cwd_grants.policy_read_paths,
+            BTreeSet::from([PathBuf::from(".")])
+        );
+        assert!(analysis.cwd_grants.policy_read_write_paths.is_empty());
+        assert_eq!(
+            analysis.cwd_grants.policy_device_paths,
+            BTreeSet::from([PathBuf::from("device")])
+        );
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        for (method, path) in [
+            ("read", "/sys/example"),
+            ("read_exec", "/captured-only/library.so"),
+            ("read_write", "/captured-only/state"),
+            ("device", "/captured-only/device"),
+        ] {
+            assert!(has_generated_grant(&source, method, path));
+            assert_eq!(
+                source
+                    .matches(&format!("profile = profile.{method}(path);"))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(source.matches("if path.exists() {").count(), 4);
+        assert_eq!(
+            source
+                .matches("let path = std::path::Path::new(path);")
+                .count(),
+            4
+        );
+        assert!(source.contains("\n        \"/captured-only/library.so\",\n"));
+        assert!(source.contains(
+            "// Read and execute paths.\n    for path in [\n        cwd.to_str().unwrap_or_default(), // Allow read/execute access to the worker's working directory.\n"
+        ));
+        assert_eq!(
+            source.matches("cwd.to_str().unwrap_or_default()").count(),
+            1
+        );
+        assert!(source.contains("let cwd = std::env::current_dir().unwrap_or_default();"));
+        assert!(!source.contains("Some("));
+        assert!(!source.contains(".flatten()"));
+        assert!(source.contains("let resolved_path = cwd.join(path);"));
+        assert!(has_generated_grant(&source, "device", "device"));
+        for path in ["library.so", "state", "device-info"] {
+            assert!(!source.contains(&rust_string(path)));
+        }
+        assert!(source.contains("pub fn vm_worker() -> Builder {"));
+        assert!(source.contains("\n    profile\n"));
+        assert!(!source.contains("Result<Builder>"));
+        let sections = [
+            "// Deny access by default.",
+            "// Read-only paths.",
+            "// Read and execute paths.",
+            "// Read/write paths.",
+            "// Device access.",
+            "// System call restrictions.",
+            "// Network access.",
+        ];
+        let positions: Vec<_> = sections
+            .iter()
+            .map(|section| source.find(section).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            source
+                .lines()
+                .filter(|line| line.trim_start().starts_with("//"))
+                .all(|line| !line.to_lowercase().contains("stage"))
+        );
+    }
+
+    #[test]
+    fn generates_read_exec_loop_for_cwd_without_absolute_candidates() {
+        let mut analysis = TraceAnalysis::default();
+        analysis
+            .cwd_grants
+            .policy_read_paths
+            .insert(PathBuf::from("missing.so"));
+        normalize_grants(&mut analysis);
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        assert_eq!(source.matches("for path in [").count(), 1);
+        assert_eq!(
+            source.matches("profile = profile.read_exec(path);").count(),
+            1
+        );
+        assert!(source.contains("\n    ] {\n"));
+        assert!(source.contains("let path = std::path::Path::new(path);"));
+        assert!(!source.contains(".flatten()"));
+        assert!(!source.contains("\"missing.so\""));
+        assert!(!source.contains("profile.read_write("));
+    }
+
     #[test]
     fn generates_profile_from_current_trace_schema() {
         let temp = tempfile::tempdir().unwrap();
@@ -918,15 +1361,15 @@ mod tests {
         let trace_report = build_profile(&TraceOptions {
             trace_dir: traces,
             worker: "vm".to_string(),
-            output_dir: temp.path().to_path_buf(),
+            profile_dir: temp.path().to_path_buf(),
         })
         .unwrap();
 
         assert_eq!(
             trace_report.policy_read_paths,
             vec![
-                PathBuf::from("/sys/devices/system/cpu"),
-                PathBuf::from("/usr/lib"),
+                PathBuf::from("/sys/devices/system/cpu/online"),
+                PathBuf::from("/usr/lib/libexample.so"),
             ]
         );
         assert_eq!(
@@ -945,19 +1388,26 @@ mod tests {
         );
         assert_eq!(trace_report.policy_network, sandbox::Network::Loopback);
         let generated = fs_err::read_to_string(trace_report.profile_path).unwrap();
-        assert!(generated.contains(".read(\"/sys/devices/system/cpu\")"));
-        assert!(generated.contains(".read_exec(\"/usr/lib\")"));
+        assert!(has_generated_grant(
+            &generated,
+            "read",
+            "/sys/devices/system/cpu/online"
+        ));
+        assert!(has_generated_grant(
+            &generated,
+            "read_exec",
+            "/usr/lib/libexample.so"
+        ));
+        assert!(has_generated_grant(
+            &generated,
+            "read_write",
+            "/denied/state/data"
+        ));
+        assert!(!has_generated_grant(&generated, "read_exec", "/usr/lib"));
         assert!(generated.contains(".network(Network::Loopback)"));
         assert!(generated.starts_with(
             "// Automatically generated sandbox profile for vm worker\n\nuse crate::Builder;"
         ));
-        assert_eq!(
-            generated
-                .lines()
-                .filter(|line| line.starts_with("//"))
-                .count(),
-            1
-        );
         assert!(!generated.contains("Observed filesystem accesses"));
         assert!(trace_report.log_path.ends_with("vm_worker.log"));
         let log = fs_err::read_to_string(trace_report.log_path).unwrap();
@@ -1057,10 +1507,10 @@ mod tests {
         normalize_grants(&mut trace_analysis);
 
         assert_eq!(
-            trace_analysis.policy_read_write_paths,
-            BTreeSet::from([PathBuf::from("/var/lib/openvmm")])
+            trace_analysis.absolute_grants.policy_read_write_paths,
+            BTreeSet::from([PathBuf::from("/var/lib/openvmm/state")])
         );
-        assert!(trace_analysis.policy_read_paths.is_empty());
+        assert!(trace_analysis.absolute_grants.policy_read_paths.is_empty());
         assert_eq!(
             trace_analysis.observed_filesystem,
             BTreeSet::from([
@@ -1068,6 +1518,192 @@ mod tests {
                 "/var/lib/openvmm/state, RW, SUCCESS".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn observed_files_do_not_grant_their_parent_directory() {
+        let analysis = analyze_events(&[
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 5,
+                "decoded_args": {"path": "/etc/hosts"},
+                "opened_file": {"file_type": "regular_file", "path": "/etc/hosts"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 6,
+                "decoded_args": {"path": "/etc/hostname"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "/etc/missing"}, "opened_file": null
+            }),
+        ]);
+        assert_eq!(
+            analysis.absolute_grants.policy_read_paths,
+            BTreeSet::from([
+                PathBuf::from("/etc/hosts"),
+                PathBuf::from("/etc/hostname"),
+                PathBuf::from("/etc/missing"),
+            ])
+        );
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        assert!(!has_generated_grant(&source, "read_exec", "/etc"));
+    }
+
+    #[test]
+    fn observed_read_directory_allows_non_executable_exact_write_exception() {
+        let analysis = analyze_events(&[
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 5,
+                "decoded_args": {"path": "/captured-only/config"},
+                "opened_file": {"file_type": "directory", "path": "/captured-only/config"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, O_RDWR, 0, 0, 0], "result": -13,
+                "decoded_args": {"path": "/captured-only/config/state"}
+            }),
+        ]);
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        assert!(has_generated_grant(
+            &source,
+            "read",
+            "/captured-only/config"
+        ));
+        assert!(has_generated_grant(
+            &source,
+            "read_write",
+            "/captured-only/config/state"
+        ));
+        assert!(!source.contains(".read_exec("));
+    }
+
+    #[test]
+    fn classifies_successful_regular_files_using_captured_execute_bits() {
+        let mut events = Vec::new();
+        let cases = [
+            ("plain", "openat", Some(0o100644), 5, 0, "read"),
+            ("owner-exec", "openat", Some(0o100100), 5, 0, "read_exec"),
+            ("group-exec", "statx", Some(0o100010), 0, 0, "read_exec"),
+            (
+                "other-exec",
+                "newfstatat",
+                Some(0o100001),
+                0,
+                0,
+                "read_exec",
+            ),
+            ("access-only", "faccessat2", Some(0o100400), 0, 0, "read"),
+            ("legacy", "openat", None, 5, 0, "read_exec"),
+            ("failed", "openat", Some(0o100644), -13, 0, "read_exec"),
+            (
+                "writable-exec",
+                "openat",
+                Some(0o100755),
+                5,
+                O_RDWR,
+                "read_write",
+            ),
+        ];
+        for (name, syscall, mode, result, flags, _) in cases {
+            let path = format!("/captured-only/{name}");
+            let metadata = serde_json::json!({
+                "file_type": "regular_file", "mode": mode, "path": path
+            });
+            events.push(serde_json::json!({
+                "event": "syscall", "syscall": syscall,
+                "args": [AT_FDCWD, 0, flags, 0, 0, 0], "result": result,
+                "decoded_args": {"path": path},
+                "opened_file": if syscall == "openat" { metadata.clone() } else { Value::Null },
+                "path_metadata": if syscall != "openat" { metadata } else { Value::Null }
+            }));
+        }
+        for (name, metadata, method) in [
+            (
+                "directory",
+                serde_json::json!({"file_type": "directory", "mode": 0o40755}),
+                "read_exec",
+            ),
+            (
+                "missing-mode",
+                serde_json::json!({"file_type": "regular_file"}),
+                "read_exec",
+            ),
+            (
+                "invalid-mode",
+                serde_json::json!({"file_type": "regular_file", "mode": "0644"}),
+                "read_exec",
+            ),
+        ] {
+            events.push(serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 5,
+                "decoded_args": {"path": format!("/captured-only/{name}")},
+                "opened_file": metadata
+            }));
+            let analysis = analyze_events(&events);
+            let source = render_profile("vm", "vm_worker", &analysis, &[]);
+            assert!(has_generated_grant(
+                &source,
+                method,
+                &format!("/captured-only/{name}")
+            ));
+        }
+        let mut analysis = analyze_events(&events);
+        normalize_grants(&mut analysis);
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        for (name, _, _, _, _, method) in cases {
+            let path = format!("/captured-only/{name}");
+            assert!(
+                has_generated_grant(&source, method, &path),
+                "{path}: {source}"
+            );
+            if method == "read" {
+                assert!(!has_generated_grant(&source, "read_exec", &path));
+            }
+        }
+    }
+
+    #[test]
+    fn executable_mode_evidence_is_order_independent_and_survives_parent_pruning() {
+        let mut events = vec![
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 5,
+                "decoded_args": {"path": "/captured-only"},
+                "opened_file": {"file_type": "directory", "mode": 0o40755}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 6,
+                "decoded_args": {"path": "/captured-only/data"},
+                "opened_file": {"file_type": "regular_file", "mode": 0o100644}
+            }),
+        ];
+        for mode in [0o100755, 0o100644] {
+            events.push(serde_json::json!({
+                "event": "syscall", "syscall": "statx",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 0,
+                "decoded_args": {"path": "/captured-only/library"},
+                "path_metadata": {"file_type": "regular_file", "mode": mode}
+            }));
+        }
+        for _ in 0..2 {
+            let mut analysis = analyze_events(&events);
+            normalize_grants(&mut analysis);
+            let source = render_profile("vm", "vm_worker", &analysis, &[]);
+            assert!(has_generated_grant(&source, "read", "/captured-only"));
+            assert!(has_generated_grant(
+                &source,
+                "read_exec",
+                "/captured-only/library"
+            ));
+            assert!(!has_generated_grant(&source, "read_exec", "/captured-only"));
+            events.reverse();
+        }
     }
 
     #[test]
@@ -1118,8 +1754,9 @@ mod tests {
         );
         assert!(
             trace_analysis
+                .absolute_grants
                 .policy_read_write_paths
-                .contains(Path::new("/var/lib/openvmm/state"))
+                .contains(Path::new("/var/lib/openvmm/state/data"))
         );
 
         observe_fd_lifecycle("close", [12, 0, 0, 0, 0, 0], Some(0), &mut trace_analysis);
@@ -1160,7 +1797,7 @@ mod tests {
             serde_json::json!({
                 "event": "syscall", "syscall": "openat",
                 "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 9,
-                "decoded_args": {"path": "settings", "path_base": "/next/config"}
+                "decoded_args": {"path": "settings", "path_base": "/work/next/config"}
             }),
             serde_json::json!({
                 "event": "syscall", "syscall": "renameat2",
@@ -1177,31 +1814,39 @@ mod tests {
             BTreeSet::from([
                 "/work/glibc-hwcaps/x86-64-v2/libgcc_s.so.1, RO, ENOENT".to_string(),
                 "/opt/libs/plugin.so, RO, SUCCESS".to_string(),
-                "/next/config/settings, RO, SUCCESS".to_string(),
+                "/work/next/config/settings, RO, SUCCESS".to_string(),
                 "/source/items/old, RW, SUCCESS".to_string(),
                 "/destination/items/new, RW, SUCCESS".to_string(),
             ])
         );
         assert_eq!(
-            trace_analysis.policy_read_paths,
-            BTreeSet::from([PathBuf::from("/opt/libs"), PathBuf::from("/next/config"),])
+            trace_analysis.absolute_grants.policy_read_paths,
+            BTreeSet::from([PathBuf::from("/opt/libs/plugin.so"),])
         );
         assert_eq!(
-            trace_analysis.policy_read_write_paths,
+            trace_analysis.cwd_grants.policy_read_paths,
             BTreeSet::from([
-                PathBuf::from("/source/items"),
-                PathBuf::from("/destination/items"),
+                PathBuf::from("next/config/settings"),
+                PathBuf::from("glibc-hwcaps/x86-64-v2/libgcc_s.so.1"),
+            ])
+        );
+        assert_eq!(
+            trace_analysis.absolute_grants.policy_read_write_paths,
+            BTreeSet::from([
+                PathBuf::from("/source/items/old"),
+                PathBuf::from("/destination/items/new"),
             ])
         );
     }
 
     #[test]
-    fn failed_filesystem_accesses_are_observed_without_grants() {
+    fn failed_filesystem_accesses_keep_exact_grants_and_results() {
         let trace_analysis = analyze_events(&[
             serde_json::json!({
                 "event": "syscall", "syscall": "openat",
                 "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
-                "decoded_args": {"path": "/missing/libraries/libexample.so"}
+                "decoded_args": {"path": "/missing/libraries/libexample.so"},
+                "opened_file": null
             }),
             serde_json::json!({
                 "event": "syscall", "syscall": "openat",
@@ -1244,13 +1889,28 @@ mod tests {
                 "/unknown/result/file, RO, UNKNOWN".to_string(),
             ])
         );
-        assert!(trace_analysis.policy_read_paths.is_empty());
-        assert!(trace_analysis.policy_read_write_paths.is_empty());
+        assert_eq!(
+            trace_analysis.absolute_grants.policy_read_paths,
+            BTreeSet::from([
+                PathBuf::from("/missing/libraries/libexample.so"),
+                PathBuf::from("/unknown/result/file"),
+            ])
+        );
+        assert_eq!(
+            trace_analysis.absolute_grants.policy_read_write_paths,
+            BTreeSet::from([
+                PathBuf::from("/denied/state/data"),
+                PathBuf::from("/existing/directory"),
+                PathBuf::from("/missing/state/data"),
+                PathBuf::from("/missing/source/old"),
+                PathBuf::from("/missing/destination/new"),
+            ])
+        );
         assert!(trace_analysis.filesystem_fd_paths.is_empty());
     }
 
     #[test]
-    fn successful_access_grants_only_its_observed_permissions() {
+    fn requested_permissions_combine_without_tracking_failed_descriptors() {
         let mut trace_analysis = TraceAnalysis::default();
         observe_path(
             "openat",
@@ -1271,11 +1931,13 @@ mod tests {
             &mut trace_analysis,
         );
 
+        normalize_grants(&mut trace_analysis);
+        assert!(trace_analysis.absolute_grants.policy_read_paths.is_empty());
         assert_eq!(
-            trace_analysis.policy_read_paths,
-            BTreeSet::from([PathBuf::from("/var/lib/openvmm")])
+            trace_analysis.absolute_grants.policy_read_write_paths,
+            BTreeSet::from([PathBuf::from("/var/lib/openvmm/state")])
         );
-        assert!(trace_analysis.policy_read_write_paths.is_empty());
+        assert!(!trace_analysis.filesystem_fd_paths.contains_key(&-13));
         assert_eq!(
             trace_analysis.filesystem_fd_paths.get(&0),
             Some(&PathBuf::from("/var/lib/openvmm/state"))
@@ -1359,8 +2021,13 @@ mod tests {
                 "<empty pathname; statx; dirfd: 8>, RO, SUCCESS".to_string(),
             ])
         );
-        assert!(trace_analysis.policy_read_paths.is_empty());
-        assert!(trace_analysis.policy_read_write_paths.is_empty());
+        assert!(trace_analysis.absolute_grants.policy_read_paths.is_empty());
+        assert!(
+            trace_analysis
+                .absolute_grants
+                .policy_read_write_paths
+                .is_empty()
+        );
         assert!(trace_analysis.filesystem_fd_paths.is_empty());
     }
 
@@ -1405,9 +2072,684 @@ mod tests {
                 "<empty pathname; statx; dirfd: 8>, RO, SUCCESS".to_string(),
             ])
         );
-        assert!(trace_analysis.policy_read_paths.is_empty());
-        assert!(trace_analysis.policy_read_write_paths.is_empty());
+        assert!(trace_analysis.absolute_grants.policy_read_paths.is_empty());
+        assert!(
+            trace_analysis
+                .absolute_grants
+                .policy_read_write_paths
+                .is_empty()
+        );
         assert!(trace_analysis.filesystem_fd_paths.is_empty());
+    }
+
+    #[test]
+    fn generates_exact_device_grants_from_captured_open_types() {
+        let events = [
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [7, 0, O_RDWR, 0, 0, 0], "result": 5,
+                "decoded_args": {"path": "vfio", "path_base": "/dev/vfio"},
+                "opened_file": {"file_type": "character_device", "path": "/dev/vfio/vfio"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 6,
+                "decoded_args": {"path": "/devices/alias"},
+                "opened_file": {"file_type": "character_device", "path": "/dev/zero"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, O_RDWR, 0, 0, 0], "result": 7,
+                "decoded_args": {"path": "/captured-only/disks/vda"},
+                "opened_file": {"file_type": "block_device", "path": "/captured-only/disks/vda"}
+            }),
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let traces = temp.path().join("traces");
+        fs_err::create_dir(&traces).unwrap();
+        fs_err::write(
+            traces.join("worker-vm.42.jsonl"),
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let report = build_profile(&TraceOptions {
+            trace_dir: traces,
+            worker: "vm".to_string(),
+            profile_dir: temp.path().join("profiles"),
+        })
+        .unwrap();
+        assert_eq!(
+            report.policy_device_paths,
+            vec![
+                PathBuf::from("/captured-only/disks/vda"),
+                PathBuf::from("/dev/vfio/vfio"),
+                PathBuf::from("/devices/alias"),
+            ]
+        );
+        assert!(report.policy_read_paths.is_empty());
+        assert!(report.policy_read_write_paths.is_empty());
+        let source = fs_err::read_to_string(report.profile_path).unwrap();
+        for path in &report.policy_device_paths {
+            assert!(has_generated_grant(
+                &source,
+                "device",
+                path.to_str().unwrap()
+            ));
+        }
+        let log = fs_err::read_to_string(report.log_path).unwrap();
+        assert!(log.contains("/dev/vfio/vfio, RW, SUCCESS"));
+        assert!(log.contains("/devices/alias, RO, SUCCESS"));
+        assert!(log.contains("/captured-only/disks/vda, RW, SUCCESS"));
+    }
+
+    #[test]
+    fn preserves_device_exceptions_and_compatible_directory_grants() {
+        let mut events = Vec::new();
+        for (path, file_type, flags) in [
+            ("/captured-only/devices", "directory", 0),
+            ("/captured-only/devices/first", "character_device", O_RDWR),
+            (
+                "/captured-only/devices/writable/state",
+                "regular_file",
+                O_RDWR,
+            ),
+            (
+                "/captured-only/devices/writable/second",
+                "block_device",
+                O_RDWR,
+            ),
+        ] {
+            events.push(serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, flags, 0, 0, 0], "result": 5,
+                "decoded_args": {"path": path},
+                "opened_file": {"file_type": file_type, "path": path}
+            }));
+        }
+        let mut analysis = analyze_events(&events);
+        normalize_grants(&mut analysis);
+        assert_eq!(analysis.absolute_grants.policy_device_paths.len(), 2);
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        assert!(has_generated_grant(
+            &source,
+            "read",
+            "/captured-only/devices"
+        ));
+        assert!(has_generated_grant(
+            &source,
+            "read_write",
+            "/captured-only/devices/writable/state"
+        ));
+        assert!(!source.contains(".read_exec("));
+        assert!(has_generated_grant(
+            &source,
+            "device",
+            "/captured-only/devices/first"
+        ));
+        assert!(has_generated_grant(
+            &source,
+            "device",
+            "/captured-only/devices/writable/second"
+        ));
+    }
+
+    #[test]
+    fn device_snapshots_grant_device_io_without_requiring_an_io_open() {
+        let mut events = Vec::new();
+        for (name, flags, result, opened_file) in [
+            (
+                "path-only",
+                O_PATH,
+                5,
+                serde_json::json!({
+                    "file_type": "character_device", "path": "/devices/path-only"
+                }),
+            ),
+            (
+                "failed",
+                O_RDWR,
+                -13,
+                serde_json::json!({
+                    "file_type": "character_device", "path": "/devices/failed"
+                }),
+            ),
+            (
+                "missing-target",
+                0,
+                5,
+                serde_json::json!({"file_type": "character_device"}),
+            ),
+            (
+                "relative-target",
+                0,
+                5,
+                serde_json::json!({
+                    "file_type": "character_device", "path": "relative/device"
+                }),
+            ),
+            (
+                "deleted",
+                0,
+                5,
+                serde_json::json!({
+                    "file_type": "character_device", "path": "/devices/deleted (deleted)"
+                }),
+            ),
+            ("unknown", 0, 5, serde_json::json!({"file_type": "unknown"})),
+            ("null", 0, 5, Value::Null),
+            ("malformed", 0, 5, serde_json::json!({"file_type": 42})),
+            (
+                "private",
+                0,
+                5,
+                serde_json::json!({
+                    "file_type": "character_device", "path": "/tmp/private-device"
+                }),
+            ),
+        ] {
+            events.push(serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, flags, 0, 0, 0], "result": result,
+                "decoded_args": {"path": format!("/devices/{name}")},
+                "opened_file": opened_file
+            }));
+        }
+        events.push(serde_json::json!({
+            "event": "syscall", "syscall": "statx",
+            "args": [5, 0, 4096, 0, 0, 0], "result": 0,
+            "decoded_args": {"path": "", "path_target": "/devices/metadata-only"},
+            "opened_file": {"file_type": "character_device", "path": "/devices/metadata-only"}
+        }));
+        let analysis = analyze_events(&events);
+        assert_eq!(analysis.observed_filesystem.len(), events.len());
+        assert_eq!(
+            analysis.absolute_grants.policy_device_paths,
+            BTreeSet::from([
+                PathBuf::from("/devices/path-only"),
+                PathBuf::from("/devices/missing-target"),
+                PathBuf::from("/devices/relative-target"),
+                PathBuf::from("/devices/deleted"),
+                PathBuf::from("/devices/private"),
+            ])
+        );
+        assert_eq!(
+            analysis.absolute_grants.policy_read_paths,
+            BTreeSet::from([
+                PathBuf::from("/devices/unknown"),
+                PathBuf::from("/devices/null"),
+                PathBuf::from("/devices/malformed"),
+            ])
+        );
+        assert_eq!(
+            analysis.absolute_grants.policy_read_write_paths,
+            BTreeSet::from([PathBuf::from("/devices/failed")])
+        );
+    }
+
+    #[test]
+    fn uses_descriptor_snapshot_when_open_path_is_unavailable() {
+        let analysis = analyze_events(&[
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 5,
+                "decoded_args": null,
+                "opened_file": {"file_type": "character_device", "path": "/devices/unreadable"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, O_RDWR, 0, 0, 0], "result": 6,
+                "decoded_args": {"path": "relative", "path_base": null},
+                "opened_file": {"file_type": "block_device", "path": "/devices/relative"}
+            }),
+        ]);
+        assert_eq!(
+            analysis.absolute_grants.policy_device_paths,
+            BTreeSet::from([PathBuf::from("/devices/unreadable"),])
+        );
+        assert!(!analysis.unportable_paths.is_empty());
+        assert!(analysis.absolute_grants.policy_read_paths.is_empty());
+        assert!(analysis.absolute_grants.policy_read_write_paths.is_empty());
+    }
+
+    #[test]
+    fn known_non_device_objects_keep_ordinary_grants() {
+        let events = [
+            ("regular_file", "/dev/captured-regular"),
+            ("directory", "/dev/captured-directory"),
+            ("symlink", "/dev/captured-symlink"),
+            ("fifo", "/captured-only/fifo"),
+            ("socket", "/captured-only/socket"),
+        ]
+        .map(|(file_type, path)| {
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, O_RDWR, 0, 0, 0], "result": 5,
+                "decoded_args": {"path": path},
+                "opened_file": {"file_type": file_type, "path": path}
+            })
+        });
+        let analysis = analyze_events(&events);
+        assert!(analysis.absolute_grants.policy_device_paths.is_empty());
+        assert_eq!(
+            analysis.absolute_grants.policy_read_write_paths,
+            BTreeSet::from([
+                PathBuf::from("/dev/captured-regular"),
+                PathBuf::from("/dev/captured-directory"),
+                PathBuf::from("/dev/captured-symlink"),
+                PathBuf::from("/captured-only/fifo"),
+                PathBuf::from("/captured-only/socket"),
+            ])
+        );
+    }
+
+    #[test]
+    fn metadata_queries_grant_exact_device_io_paths() {
+        let mut events = Vec::new();
+        for (syscall, path, kind) in [
+            ("statx", "/dev/vfio/vfio", "character_device"),
+            ("newfstatat", "/captured-only/disks/vda", "block_device"),
+        ] {
+            events.push(serde_json::json!({
+                "event": "syscall", "syscall": syscall,
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 0,
+                "decoded_args": {"path": path},
+                "path_metadata": {
+                    "file_type": kind, "device_major": 1, "device_minor": 3
+                }
+            }));
+        }
+        events.push(serde_json::json!({
+            "event": "syscall", "syscall": "statx",
+            "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 0,
+            "decoded_args": {"path": "alias", "path_base": "/devices"},
+            "path_metadata": {"file_type": "character_device"}
+        }));
+        let mut analysis = analyze_events(&events);
+        normalize_grants(&mut analysis);
+        assert_eq!(
+            analysis.absolute_grants.policy_device_paths,
+            BTreeSet::from([
+                PathBuf::from("/dev/vfio/vfio"),
+                PathBuf::from("/captured-only/disks/vda"),
+            ])
+        );
+        assert_eq!(
+            analysis.cwd_grants.policy_read_paths,
+            BTreeSet::from([PathBuf::from(".")])
+        );
+        assert_eq!(
+            analysis.cwd_grants.policy_device_paths,
+            BTreeSet::from([PathBuf::from("alias")])
+        );
+        assert!(analysis.absolute_grants.policy_read_paths.is_empty());
+        assert!(analysis.absolute_grants.policy_read_write_paths.is_empty());
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        assert!(has_generated_grant(&source, "device", "/dev/vfio/vfio"));
+        assert!(has_generated_grant(
+            &source,
+            "device",
+            "/captured-only/disks/vda"
+        ));
+        assert!(source.contains("cwd.to_str().unwrap_or_default()"));
+        assert!(has_generated_grant(&source, "device", "alias"));
+        assert!(source.contains("let resolved_path = cwd.join(path);"));
+        assert_eq!(source.matches("profile.read_exec(path)").count(), 1);
+    }
+
+    #[test]
+    fn device_grants_preserve_ancestors_regardless_of_io_open() {
+        for opened in [false, true] {
+            let mut events = vec![
+                serde_json::json!({
+                    "event": "syscall", "syscall": "openat",
+                    "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 4,
+                    "decoded_args": {"path": "/dev"},
+                    "opened_file": {"file_type": "directory", "path": "/dev"}
+                }),
+                serde_json::json!({
+                    "event": "syscall", "syscall": "openat",
+                    "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -13,
+                    "decoded_args": {"path": "/dev/null"}, "opened_file": null
+                }),
+                serde_json::json!({
+                    "event": "syscall", "syscall": "statx",
+                    "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 0,
+                    "decoded_args": {"path": "/dev/null"},
+                    "path_metadata": {"file_type": "character_device"}
+                }),
+            ];
+            if opened {
+                events.push(serde_json::json!({
+                    "event": "syscall", "syscall": "openat",
+                    "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 5,
+                    "decoded_args": {"path": "/dev/null"},
+                    "opened_file": {"file_type": "character_device", "path": "/dev/null"}
+                }));
+                events.push(serde_json::json!({
+                    "event": "syscall", "syscall": "openat",
+                    "args": [AT_FDCWD, 0, O_RDWR, 0, 0, 0], "result": -13,
+                    "decoded_args": {"path": "/dev/null"}, "opened_file": null
+                }));
+            }
+            let mut analysis = analyze_events(&events);
+            normalize_grants(&mut analysis);
+            let source = render_profile("vm", "vm_worker", &analysis, &[]);
+            assert!(has_generated_grant(&source, "read", "/dev"));
+            assert!(!source.contains(".read_exec("));
+            assert!(has_generated_grant(&source, "device", "/dev/null"));
+            assert!(!has_generated_grant(&source, "read", "/dev/null"));
+            assert!(!has_generated_grant(&source, "read_write", "/dev/null"));
+        }
+    }
+
+    #[test]
+    fn unknown_and_failed_dev_queries_grant_exact_device_paths() {
+        let events = [
+            (
+                "/dev/failed",
+                -2,
+                serde_json::json!({"file_type": "character_device"}),
+            ),
+            (
+                "/dev/unknown",
+                0,
+                serde_json::json!({"file_type": "unknown"}),
+            ),
+            ("/dev/null-metadata", 0, Value::Null),
+            ("/dev/malformed", 0, serde_json::json!({"file_type": 42})),
+            (
+                "/proc/device",
+                0,
+                serde_json::json!({"file_type": "character_device"}),
+            ),
+            (
+                "/tmp/device",
+                0,
+                serde_json::json!({"file_type": "block_device"}),
+            ),
+        ]
+        .map(|(path, result, metadata)| {
+            serde_json::json!({
+                "event": "syscall", "syscall": "statx",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": result,
+                "decoded_args": {"path": path}, "path_metadata": metadata
+            })
+        });
+        let analysis = analyze_events(&events);
+        assert_eq!(analysis.observed_filesystem.len(), events.len());
+        assert_eq!(
+            analysis.absolute_grants.policy_device_paths,
+            BTreeSet::from([
+                PathBuf::from("/dev/failed"),
+                PathBuf::from("/dev/unknown"),
+                PathBuf::from("/dev/null-metadata"),
+                PathBuf::from("/dev/malformed"),
+            ])
+        );
+        assert!(analysis.absolute_grants.policy_read_paths.is_empty());
+        assert!(analysis.absolute_grants.policy_read_write_paths.is_empty());
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        for path in &analysis.absolute_grants.policy_device_paths {
+            assert!(has_generated_grant(
+                &source,
+                "device",
+                path.to_str().unwrap()
+            ));
+        }
+        assert!(!source.contains("profile.read_exec(path)"));
+    }
+
+    #[test]
+    fn unknown_dev_paths_use_resolved_names_and_preserve_cwd_device_exceptions() {
+        let mut analysis = analyze_events(&[
+            serde_json::json!({"event": "trace_started", "cwd": "/dev"}),
+            serde_json::json!({
+                "event": "syscall", "syscall": "statx",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "sev", "path_base": "/dev"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [7, 0, O_RDWR, 0, 0, 0], "result": -13,
+                "decoded_args": {"path": "vfio/vfio", "path_base": "/dev"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "statx",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "/devices/unknown"}
+            }),
+        ]);
+        normalize_grants(&mut analysis);
+        assert_eq!(
+            analysis.cwd_grants.policy_device_paths,
+            BTreeSet::from([PathBuf::from("sev")])
+        );
+        assert_eq!(
+            analysis.absolute_grants.policy_device_paths,
+            BTreeSet::from([PathBuf::from("/dev/vfio/vfio")])
+        );
+        assert_eq!(
+            analysis.absolute_grants.policy_read_paths,
+            BTreeSet::from([PathBuf::from("/devices/unknown")])
+        );
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        assert!(has_generated_grant(&source, "device", "sev"));
+        assert!(has_generated_grant(&source, "device", "/dev/vfio/vfio"));
+        assert!(!has_generated_grant(&source, "read_exec", "sev"));
+    }
+
+    #[test]
+    fn portable_grants_keep_anchors_and_minimize_observed_ancestors() {
+        let mut analysis = analyze_events(&[
+            serde_json::json!({"event": "trace_started", "cwd": "/capture/container-a"}),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, O_RDWR, 0, 0, 0], "result": -13,
+                "decoded_args": {"path": "state/data", "path_base": "/capture/container-a"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "statx",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 0,
+                "decoded_args": {"path": "state", "path_base": "/capture/container-a"},
+                "path_metadata": {"file_type": "directory"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 7,
+                "decoded_args": {"path": "lib", "path_base": "/capture/container-a"},
+                "opened_file": {"file_type": "directory", "path": "/capture/container-a/lib"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [7, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "plugin.so", "path_base": "/capture/container-a/lib"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [8, 0, 0, 0, 0, 0], "result": 9,
+                "decoded_args": {"path": "outside.so", "path_base": "/opt/libs"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "links/../data", "path_base": "/capture/container-a"}
+            }),
+        ]);
+        assert!(analysis.unportable_paths.is_empty());
+        normalize_grants(&mut analysis);
+        let source = render_profile("vm", "vm_worker", &analysis, &[]);
+        assert!(source.contains("-> Builder"));
+        assert!(source.contains("let cwd = std::env::current_dir().unwrap_or_default();"));
+        assert!(source.contains("cwd.to_str().unwrap_or_default()"));
+        for path in ["state", "state/data", "lib", "links/../data"] {
+            assert!(!source.contains(&rust_string(path)));
+        }
+        assert!(has_generated_grant(
+            &source,
+            "read_exec",
+            "/opt/libs/outside.so"
+        ));
+        assert!(!source.contains("/capture/container-a"));
+        assert!(
+            analysis
+                .observed_filesystem
+                .contains("/capture/container-a/lib/plugin.so, RO, ENOENT")
+        );
+        assert!(!is_covered(
+            Path::new("links/../data"),
+            &BTreeSet::from([PathBuf::from("links")])
+        ));
+    }
+
+    #[test]
+    fn deduplicates_portable_paths_across_runs_without_absorbing_absolute_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        for id in ["first", "second"] {
+            let events = [
+                serde_json::json!({"event": "trace_started", "cwd": format!("/capture/{id}")}),
+                serde_json::json!({
+                    "event": "syscall", "syscall": "openat",
+                    "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                    "decoded_args": {"path": "libc.so.6", "path_base": format!("/capture/{id}")}
+                }),
+                serde_json::json!({
+                    "event": "syscall", "syscall": "statx",
+                    "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 0,
+                    "decoded_args": {"path": "/capture/first"},
+                    "path_metadata": {"file_type": "directory"}
+                }),
+            ];
+            fs_err::write(
+                temp.path().join(format!("worker-vm.{id}.jsonl")),
+                events
+                    .iter()
+                    .map(|event| format!("{event}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+        let report = build_profile(&TraceOptions {
+            trace_dir: temp.path().to_path_buf(),
+            worker: "vm".into(),
+            profile_dir: temp.path().join("profiles"),
+        })
+        .unwrap();
+        assert_eq!(
+            report.policy_cwd.policy_read_paths,
+            BTreeSet::from([PathBuf::from(".")])
+        );
+        assert!(report.policy_cwd.policy_read_write_paths.is_empty());
+        let source = fs_err::read_to_string(&report.profile_path).unwrap();
+        assert_eq!(
+            source.matches("cwd.to_str().unwrap_or_default()").count(),
+            1
+        );
+        assert!(!source.contains("\"libc.so.6\""));
+        for id in ["first", "second"] {
+            assert!(
+                report
+                    .observed_filesystem
+                    .contains(&format!("/capture/{id}/libc.so.6, RO, ENOENT"))
+            );
+        }
+        assert_eq!(
+            report.policy_read_paths,
+            vec![PathBuf::from("/capture/first")]
+        );
+    }
+
+    #[test]
+    fn rejects_cwd_lookups_outside_the_startup_anchor() {
+        let analysis = analyze_events(&[
+            serde_json::json!({"event": "trace_started", "cwd": "/capture/first"}),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                "decoded_args": {"path": "libc.so.6", "path_base": "/unrelated"}
+            }),
+        ]);
+        assert!(!analysis.unportable_paths.is_empty());
+        assert!(analysis.absolute_grants.is_empty());
+        assert!(analysis.cwd_grants.is_empty());
+    }
+
+    #[test]
+    fn portable_fd_origins_follow_duplication_and_are_invalidated_on_replacement() {
+        let mut analysis = analyze_events(&[
+            serde_json::json!({"event": "trace_started", "cwd": "/capture/worker"}),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": 5,
+                "decoded_args": {"path": "config", "path_base": "/capture/worker"},
+                "opened_file": {"file_type": "directory", "path": "/capture/worker/config"}
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "dup",
+                "args": [5, 0, 0, 0, 0, 0], "result": 8
+            }),
+            serde_json::json!({
+                "event": "syscall", "syscall": "openat",
+                "args": [8, 0, O_RDWR, 0, 0, 0], "result": -13,
+                "decoded_args": {"path": "state", "path_base": "/capture/worker/config"}
+            }),
+        ]);
+        assert!(
+            analysis
+                .cwd_grants
+                .policy_read_write_paths
+                .contains(Path::new("config/state"))
+        );
+        observe_fd_lifecycle("dup2", [99, 8, 0, 0, 0, 0], Some(8), &mut analysis);
+        assert!(!analysis.filesystem_cwd_fd_paths.contains_key(&8));
+        observe_fd_lifecycle("close", [5, 0, 0, 0, 0, 0], Some(0), &mut analysis);
+        assert!(!analysis.filesystem_cwd_fd_paths.contains_key(&5));
+    }
+
+    #[test]
+    fn minimization_keeps_stronger_children_independent_of_observation_order() {
+        for parent_write in [false, true] {
+            let mut events = vec![
+                serde_json::json!({
+                    "event": "syscall", "syscall": "openat",
+                    "args": [AT_FDCWD, 0, if parent_write { O_RDWR } else { 0 }, 0, 0, 0], "result": -13,
+                    "decoded_args": {"path": "/data"}
+                }),
+                serde_json::json!({
+                    "event": "syscall", "syscall": "openat",
+                    "args": [AT_FDCWD, 0, O_RDWR, 0, 0, 0], "result": -13,
+                    "decoded_args": {"path": "/data/state"}
+                }),
+                serde_json::json!({
+                    "event": "syscall", "syscall": "openat",
+                    "args": [AT_FDCWD, 0, 0, 0, 0, 0], "result": -2,
+                    "decoded_args": {"path": "/data/config"}
+                }),
+            ];
+            for _ in 0..2 {
+                let mut analysis = analyze_events(&events);
+                normalize_grants(&mut analysis);
+                assert_eq!(
+                    analysis.absolute_grants.policy_read_write_paths,
+                    BTreeSet::from([PathBuf::from(if parent_write {
+                        "/data"
+                    } else {
+                        "/data/state"
+                    })])
+                );
+                assert_eq!(
+                    analysis.absolute_grants.policy_read_paths,
+                    if parent_write {
+                        BTreeSet::new()
+                    } else {
+                        BTreeSet::from([PathBuf::from("/data")])
+                    }
+                );
+                events.reverse();
+            }
+        }
     }
 
     fn analyze_events(events: &[Value]) -> TraceAnalysis {

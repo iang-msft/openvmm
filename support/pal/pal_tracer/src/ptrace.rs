@@ -7,6 +7,7 @@
 #![expect(unsafe_code)]
 
 use crate::TraceConfig;
+use fs_err::os::unix::fs::OpenOptionsExt;
 use seccompiler::SeccompAction;
 use seccompiler::SeccompFilter;
 use seccompiler::TargetArch;
@@ -23,6 +24,8 @@ use std::mem::MaybeUninit;
 use std::mem::size_of;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
@@ -177,6 +180,8 @@ struct PendingSyscall {
     args: [u64; 6],
     started: Instant,
     decoded_args: Value,
+    path_metadata: Option<Value>,
+    path2_metadata: Option<Value>,
 }
 
 // Runs the tracing loop for one child process tree: attaches before exec,
@@ -227,6 +232,8 @@ fn trace_process(
         }
     };
 
+    let initial_cwd = fd_target(child_pid, libc::AT_FDCWD as u64);
+
     // Release the pre-exec group stop. PTRACE_O_TRACEEXEC guarantees another
     // stop before the child's new image executes user code.
     // SAFETY: kill accepts any PID and signal value; errors are reported via errno.
@@ -238,6 +245,7 @@ fn trace_process(
             "event": "trace_started",
             "pid": child_pid,
             "trace_file": trace_path,
+            "cwd": initial_cwd,
         }),
     )?;
 
@@ -442,12 +450,24 @@ fn handle_seccomp_stop(
         })?;
     // Decode pointer arguments while the task is stopped at entry. The child
     // may change or unmap the referenced memory before the syscall returns.
+    let started = Instant::now();
+    let decoded_args = decode_args(tid, sys_nr, entry.args);
+    // Unlink and rename can remove the source before the exit stop.
+    let destructive = sys_nr == libc::SYS_unlinkat as u64 || sys_nr == libc::SYS_renameat2 as u64;
+    let path_metadata = destructive
+        .then(|| snapshot_path_metadata(tid, sys_nr, entry.args, &decoded_args, false))
+        .flatten();
+    let path2_metadata = (sys_nr == libc::SYS_renameat2 as u64)
+        .then(|| snapshot_path_metadata(tid, sys_nr, entry.args, &decoded_args, true))
+        .flatten();
     *pending = Some(PendingSyscall {
         sys_nr,
         name: name.clone(),
         args: entry.args,
-        started: Instant::now(),
-        decoded_args: decode_args(tid, sys_nr, entry.args),
+        started,
+        decoded_args,
+        path_metadata,
+        path2_metadata,
     });
     Ok(())
 }
@@ -482,6 +502,37 @@ fn handle_syscall_exit(
     let entry = pending
         .take()
         .ok_or_else(|| io::Error::other("syscall exit stop has no pending seccomp event"))?;
+    let opened_file = (entry.sys_nr == libc::SYS_openat as u64
+        && exit.is_error == 0
+        && exit.sval >= 0)
+        .then(|| {
+            opened_file_metadata(tid, exit.sval).unwrap_or_else(|_| json!({"file_type": "unknown"}))
+        });
+    let success = exit.is_error == 0 && exit.sval >= 0;
+    let path_metadata = success
+        .then(|| {
+            if entry.sys_nr == libc::SYS_statx as u64 || entry.sys_nr == libc::SYS_newfstatat as u64
+            {
+                Some(
+                    stat_file_metadata(tid, entry.sys_nr, entry.args)
+                        .unwrap_or_else(|_| json!({"file_type": "unknown"})),
+                )
+            } else if entry.sys_nr == libc::SYS_openat as u64 {
+                None
+            } else {
+                entry.path_metadata.or_else(|| {
+                    snapshot_path_metadata(
+                        tid,
+                        entry.sys_nr,
+                        entry.args,
+                        &entry.decoded_args,
+                        false,
+                    )
+                })
+            }
+        })
+        .flatten();
+    let path2_metadata = success.then_some(entry.path2_metadata).flatten();
     write_event(
         output,
         json!({
@@ -493,12 +544,161 @@ fn handle_syscall_exit(
             "sys_nr": entry.sys_nr,
             "args": entry.args,
             "decoded_args": entry.decoded_args,
+            "opened_file": opened_file,
+            "path_metadata": path_metadata,
+            "path2_metadata": path2_metadata,
             "result": exit.sval,
             "errno": (exit.is_error != 0).then(|| -exit.sval),
             "duration_ns": entry.started.elapsed().as_nanos(),
         }),
     )?;
     Ok(())
+}
+
+fn opened_file_metadata(tid: i32, fd: i64) -> io::Result<Value> {
+    // O_PATH pins the object without reopening the device for I/O. Other
+    // threads can still close/reuse the tracee's fd before this snapshot.
+    let file = fs_err::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(format!("/proc/{tid}/fd/{fd}"))?;
+    let metadata = file.metadata()?;
+    let mut snapshot = file_metadata(
+        metadata.mode(),
+        libc::major(metadata.rdev()),
+        libc::minor(metadata.rdev()),
+    );
+    snapshot["path"] = json!(
+        fs_err::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .ok()
+            .and_then(|path| path.into_os_string().into_string().ok())
+    );
+    Ok(snapshot)
+}
+
+fn file_metadata(mode: libc::mode_t, device_major: u32, device_minor: u32) -> Value {
+    let file_type = match mode & libc::S_IFMT {
+        libc::S_IFREG => "regular_file",
+        libc::S_IFDIR => "directory",
+        libc::S_IFCHR => "character_device",
+        libc::S_IFBLK => "block_device",
+        libc::S_IFIFO => "fifo",
+        libc::S_IFSOCK => "socket",
+        libc::S_IFLNK => "symlink",
+        _ => "other",
+    };
+    let is_device = matches!(file_type, "character_device" | "block_device");
+    json!({
+        "file_type": file_type,
+        "mode": mode,
+        "executable": mode & 0o111 != 0,
+        "device_major": is_device.then_some(device_major),
+        "device_minor": is_device.then_some(device_minor),
+    })
+}
+
+fn snapshot_path_metadata(
+    tid: i32,
+    sys_nr: u64,
+    args: [u64; 6],
+    decoded: &Value,
+    second_path: bool,
+) -> Option<Value> {
+    let path = decoded[if second_path { "path2" } else { "path" }].as_str()?;
+    let dirfd = args[if second_path { 2 } else { 0 }] as libc::c_int;
+    if path.is_empty() && dirfd != libc::AT_FDCWD {
+        return Some(
+            opened_file_metadata(tid, dirfd.into())
+                .unwrap_or_else(|_| json!({"file_type": "unknown"})),
+        );
+    }
+    let source = if Path::new(path).is_absolute() {
+        Path::new(&format!("/proc/{tid}/root")).join(path.trim_start_matches('/'))
+    } else {
+        let base = if dirfd == libc::AT_FDCWD {
+            format!("/proc/{tid}/cwd")
+        } else {
+            format!("/proc/{tid}/fd/{dirfd}")
+        };
+        Path::new(&base).join(path)
+    };
+    let nofollow = !path.is_empty()
+        && (sys_nr == libc::SYS_readlinkat as u64
+            || sys_nr == libc::SYS_unlinkat as u64
+            || sys_nr == libc::SYS_renameat2 as u64
+            || (sys_nr == libc::SYS_faccessat2 as u64
+                && args[3] & libc::AT_SYMLINK_NOFOLLOW as u64 != 0));
+    let snapshot = || -> io::Result<Value> {
+        let file = fs_err::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                libc::O_PATH | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 },
+            )
+            .open(source)?;
+        let metadata = file.metadata()?;
+        Ok(file_metadata(
+            metadata.mode(),
+            libc::major(metadata.rdev()),
+            libc::minor(metadata.rdev()),
+        ))
+    };
+    Some(snapshot().unwrap_or_else(|_| json!({"file_type": "unknown"})))
+}
+
+fn stat_file_metadata(tid: i32, sys_nr: u64, args: [u64; 6]) -> io::Result<Value> {
+    let metadata = if sys_nr == libc::SYS_statx as u64 {
+        let bytes = read_process_memory(tid, args[4], 0x88)?;
+        parse_statx_metadata(&bytes)
+    } else {
+        let bytes = read_process_memory(tid, args[2], size_of::<libc::stat>())?;
+        parse_stat_metadata(&bytes)
+    };
+    metadata.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unavailable file type in stat result",
+        )
+    })
+}
+
+fn parse_statx_metadata(bytes: &[u8]) -> Option<Value> {
+    // Fixed Linux UAPI layout, including on musl:
+    // https://github.com/torvalds/linux/blob/v6.12/include/uapi/linux/stat.h
+    let mask = u32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    if mask & 1 == 0 {
+        return None;
+    }
+    let mode = u16::from_ne_bytes(bytes.get(0x1c..0x1e)?.try_into().ok()?);
+    let major = u32::from_ne_bytes(bytes.get(0x80..0x84)?.try_into().ok()?);
+    let minor = u32::from_ne_bytes(bytes.get(0x84..0x88)?.try_into().ok()?);
+    let mut snapshot = file_metadata(mode.into(), major, minor);
+    if mask & 2 == 0 {
+        snapshot["mode"] = Value::Null;
+        snapshot["executable"] = Value::Null;
+    }
+    Some(snapshot)
+}
+
+fn parse_stat_metadata(bytes: &[u8]) -> Option<Value> {
+    let mode_offset = std::mem::offset_of!(libc::stat, st_mode);
+    let device_offset = std::mem::offset_of!(libc::stat, st_rdev);
+    let mode = libc::mode_t::from_ne_bytes(
+        bytes
+            .get(mode_offset..mode_offset + size_of::<libc::mode_t>())?
+            .try_into()
+            .ok()?,
+    );
+    let device = libc::dev_t::from_ne_bytes(
+        bytes
+            .get(device_offset..device_offset + size_of::<libc::dev_t>())?
+            .try_into()
+            .ok()?,
+    );
+    Some(file_metadata(
+        mode,
+        libc::major(device),
+        libc::minor(device),
+    ))
 }
 
 // Converts policy-relevant pointer arguments into stable trace data. Keeping
@@ -514,6 +714,8 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
         return json!({
             "path_base": path_base(tid, args[0], path.as_deref()),
             "path2_base": path_base(tid, args[2], path2.as_deref()),
+            "path_origin": path_origin(args[0], path.as_deref()),
+            "path2_origin": path_origin(args[2], path2.as_deref()),
             "path": path,
             "path2": path2,
         });
@@ -536,6 +738,7 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
     if let Some(path) = path_address.and_then(|address| read_c_string(tid, address).ok()) {
         return json!({
             "path_base": path_base(tid, args[0], Some(&path)),
+            "path_origin": path_origin(args[0], Some(&path)),
             "path_target": empty_path_target(tid, sys_nr, args, &path),
             "path": path,
         });
@@ -553,6 +756,19 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
     }
 
     Value::Null
+}
+
+fn path_origin(dirfd: u64, path: Option<&str>) -> Option<&'static str> {
+    let path = Path::new(path?);
+    Some(if path.as_os_str().is_empty() {
+        "empty"
+    } else if path.is_absolute() {
+        "absolute"
+    } else if dirfd as libc::c_int == libc::AT_FDCWD {
+        "cwd_relative"
+    } else {
+        "dirfd_relative"
+    })
 }
 
 fn path_base(tid: i32, dirfd: u64, path: Option<&str>) -> Option<String> {
@@ -785,6 +1001,7 @@ mod tests {
     use std::os::fd::AsFd;
     use std::os::fd::AsRawFd;
     use std::os::fd::BorrowedFd;
+    use std::os::unix::fs::PermissionsExt;
     use test_with_tracing::test;
 
     #[test]
@@ -900,6 +1117,14 @@ mod tests {
             );
             assert_eq!(decoded["path"], path.to_str().unwrap());
             assert_eq!(decoded["path_base"], expected.to_str().unwrap());
+            assert_eq!(
+                decoded["path_origin"],
+                if dirfd as libc::c_int == libc::AT_FDCWD {
+                    "cwd_relative"
+                } else {
+                    "dirfd_relative"
+                }
+            );
         }
 
         for (dirfd, path) in [
@@ -937,6 +1162,8 @@ mod tests {
         );
         assert_eq!(decoded["path"], "old");
         assert_eq!(decoded["path2"], "new");
+        assert_eq!(decoded["path_origin"], "dirfd_relative");
+        assert_eq!(decoded["path2_origin"], "dirfd_relative");
         assert_eq!(
             decoded["path_base"],
             fs_err::canonicalize(source.path())
@@ -1066,14 +1293,237 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_opened_objects_through_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let directory = File::open(dir.path()).unwrap();
+        let alias = dir.path().join("device-alias");
+        std::os::unix::fs::symlink("/dev/null", &alias).unwrap();
+        let device = fs_err::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(&alias)
+            .unwrap();
+        let tid = std::process::id() as i32;
+
+        for (fd, expected_type, expected_path) in [
+            (file.as_raw_fd(), "regular_file", file.path()),
+            (directory.as_raw_fd(), "directory", dir.path()),
+            (
+                device.as_raw_fd(),
+                "character_device",
+                Path::new("/dev/null"),
+            ),
+        ] {
+            let snapshot = opened_file_metadata(tid, fd as i64).unwrap();
+            assert_eq!(snapshot["file_type"], expected_type);
+            let mode = fs_err::metadata(expected_path).unwrap().mode();
+            assert_eq!(snapshot["mode"], mode);
+            assert_eq!(snapshot["executable"], mode & 0o111 != 0);
+            assert_eq!(
+                snapshot["path"],
+                fs_err::canonicalize(expected_path)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            );
+            if expected_type == "character_device" {
+                let metadata = device.metadata().unwrap();
+                assert_eq!(snapshot["device_major"], libc::major(metadata.rdev()));
+                assert_eq!(snapshot["device_minor"], libc::minor(metadata.rdev()));
+            } else {
+                assert!(snapshot["device_major"].is_null());
+                assert!(snapshot["device_minor"].is_null());
+            }
+        }
+
+        for mode in [0o644, 0o100, 0o010, 0o001] {
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            let snapshot = opened_file_metadata(tid, file.as_raw_fd() as i64).unwrap();
+            assert_eq!(snapshot["mode"], libc::S_IFREG | mode);
+            assert_eq!(snapshot["executable"], mode & 0o111 != 0);
+        }
+        let original = fs_err::canonicalize(file.path()).unwrap();
+        fs_err::remove_file(file.path()).unwrap();
+        let snapshot = opened_file_metadata(tid, file.as_raw_fd() as i64).unwrap();
+        assert_eq!(snapshot["file_type"], "regular_file");
+        assert_eq!(
+            snapshot["path"],
+            format!("{} (deleted)", original.display())
+        );
+        assert!(opened_file_metadata(tid, -1).is_err());
+        assert!(opened_file_metadata(tid, i64::MAX).is_err());
+    }
+
+    #[test]
+    fn decodes_stat_result_types_and_device_numbers() {
+        for (kind, expected) in [
+            (libc::S_IFCHR, "character_device"),
+            (libc::S_IFBLK, "block_device"),
+            (libc::S_IFREG, "regular_file"),
+            (libc::S_IFDIR, "directory"),
+            (libc::S_IFLNK, "symlink"),
+        ] {
+            let mode = kind | 0o751;
+            let mut statx = vec![0u8; 0x88];
+            statx[..4].copy_from_slice(&3u32.to_ne_bytes());
+            statx[0x1c..0x1e].copy_from_slice(&(mode as u16).to_ne_bytes());
+            statx[0x80..0x84].copy_from_slice(&1u32.to_ne_bytes());
+            statx[0x84..0x88].copy_from_slice(&3u32.to_ne_bytes());
+            let mut stat = vec![0u8; size_of::<libc::stat>()];
+            let mode_offset = std::mem::offset_of!(libc::stat, st_mode);
+            let device_offset = std::mem::offset_of!(libc::stat, st_rdev);
+            stat[mode_offset..mode_offset + size_of::<libc::mode_t>()]
+                .copy_from_slice(&mode.to_ne_bytes());
+            stat[device_offset..device_offset + size_of::<libc::dev_t>()]
+                .copy_from_slice(&libc::makedev(1, 3).to_ne_bytes());
+            for snapshot in [
+                parse_statx_metadata(&statx).unwrap(),
+                parse_stat_metadata(&stat).unwrap(),
+            ] {
+                assert_eq!(snapshot["file_type"], expected);
+                assert_eq!(snapshot["mode"], mode);
+                assert_eq!(snapshot["executable"], true);
+                if matches!(kind, libc::S_IFCHR | libc::S_IFBLK) {
+                    assert_eq!(snapshot["device_major"], 1);
+                    assert_eq!(snapshot["device_minor"], 3);
+                } else {
+                    assert!(snapshot["device_major"].is_null());
+                    assert!(snapshot["device_minor"].is_null());
+                }
+            }
+            for length in 0..statx.len() {
+                assert!(parse_statx_metadata(&statx[..length]).is_none());
+            }
+            statx[..4].copy_from_slice(&1u32.to_ne_bytes());
+            let snapshot = parse_statx_metadata(&statx).unwrap();
+            assert_eq!(snapshot["file_type"], expected);
+            assert!(snapshot["mode"].is_null());
+            assert!(snapshot["executable"].is_null());
+            statx[..4].fill(0);
+            assert!(parse_statx_metadata(&statx).is_none());
+            assert!(parse_stat_metadata(&[]).is_none());
+        }
+    }
+
+    #[test]
+    fn snapshots_path_modes_with_lookup_and_symlink_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(file.path(), &alias).unwrap();
+        let directory = File::open(dir.path()).unwrap();
+        let tid = std::process::id() as i32;
+        for (sys_nr, flags, expected_type) in [
+            (libc::SYS_faccessat, 0, "regular_file"),
+            (libc::SYS_faccessat2, 0, "regular_file"),
+            (libc::SYS_faccessat2, libc::AT_SYMLINK_NOFOLLOW, "symlink"),
+            (libc::SYS_readlinkat, 0, "symlink"),
+            (libc::SYS_unlinkat, 0, "symlink"),
+            (libc::SYS_renameat2, 0, "symlink"),
+        ] {
+            for (dirfd, path) in [
+                (libc::AT_FDCWD, alias.to_str().unwrap()),
+                (directory.as_raw_fd(), "alias"),
+            ] {
+                let metadata = snapshot_path_metadata(
+                    tid,
+                    sys_nr as u64,
+                    [dirfd as u64, 0, 0, flags as u64, 0, 0],
+                    &json!({"path": path}),
+                    false,
+                )
+                .unwrap();
+                assert_eq!(metadata["file_type"], expected_type);
+                assert_eq!(
+                    metadata["mode"],
+                    if expected_type == "symlink" {
+                        fs_err::symlink_metadata(&alias).unwrap().mode()
+                    } else {
+                        libc::S_IFREG | 0o640
+                    }
+                );
+            }
+        }
+        let metadata = snapshot_path_metadata(
+            tid,
+            libc::SYS_renameat2 as u64,
+            [0, 0, directory.as_raw_fd() as u64, 0, 0, 0],
+            &json!({"path2": file.path().file_name().unwrap().to_str().unwrap()}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(metadata["mode"], libc::S_IFREG | 0o640);
+    }
+
+    #[test]
+    fn traces_device_metadata_queries() {
+        for (program, args) in [
+            ("/usr/bin/stat", vec!["--format=%F", "/dev/null"]),
+            ("/bin/sh", vec!["-c", "test -c /dev/null"]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = TraceConfig::new(
+                dir.path().to_path_buf(),
+                "worker",
+                BTreeMap::from([
+                    (libc::SYS_statx, "statx".to_string()),
+                    (libc::SYS_newfstatat, "newfstatat".to_string()),
+                ]),
+            );
+            let mut command = pal::unix::process::Builder::new(program);
+            command.args(args);
+            command.set_trace_seccomp_filter(build_seccomp_filter(&config).unwrap());
+            let child = command.spawn().unwrap();
+            let pid = child.id();
+            let mut traced = TracedChild::start(child, "metadata", config).unwrap();
+            assert!(
+                futures::executor::block_on(traced.wait())
+                    .unwrap()
+                    .success()
+            );
+            let contents =
+                fs_err::read_to_string(dir.path().join(format!("worker-metadata.{pid}.jsonl")))
+                    .unwrap();
+            let events = contents
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                events.iter().any(|event| {
+                    event["decoded_args"]["path"] == "/dev/null"
+                        && event["result"] == 0
+                        && event["path_metadata"]["file_type"] == "character_device"
+                        && event["path_metadata"]["device_major"] == 1
+                        && event["path_metadata"]["device_minor"] == 3
+                        && event["path_metadata"]["mode"]
+                            == fs_err::metadata("/dev/null").unwrap().mode()
+                        && event["opened_file"].is_null()
+                }),
+                "{program}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
     fn traces_process_to_json_lines() {
         let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        data.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o640))
+            .unwrap();
         let config = TraceConfig::new(
             dir.path().to_path_buf(),
             "worker",
             BTreeMap::from([(libc::SYS_openat, "openat".to_string())]),
         );
-        let mut command = pal::unix::process::Builder::new("/usr/bin/true");
+        let mut command = pal::unix::process::Builder::new("/usr/bin/cat");
+        command.args(["/dev/null", data.path().to_str().unwrap()]);
         command.set_trace_seccomp_filter(build_seccomp_filter(&config).unwrap());
         let child = command.spawn().unwrap();
         let pid = child.id();
@@ -1087,6 +1537,12 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
             .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["decoded_args"]["path"] == data.path().to_str().unwrap()
+                && event["result"].as_i64().is_some_and(|fd| fd >= 0)
+                && event["opened_file"]["mode"] == libc::S_IFREG | 0o640
+                && event["opened_file"]["executable"] == false
+        }));
         assert!(
             events
                 .iter()
@@ -1110,6 +1566,22 @@ mod tests {
                 })
         );
         assert!(events.iter().any(|event| event["event"] == "task_exit"));
+        assert!(events.iter().any(|event| {
+            event["event"] == "syscall"
+                && event["decoded_args"]["path"] == "/dev/null"
+                && event["opened_file"]["file_type"] == "character_device"
+                && event["opened_file"]["path"] == "/dev/null"
+                && event["result"].as_i64().is_some_and(|result| result >= 0)
+        }));
+        assert!(
+            events
+                .iter()
+                .filter(|event| {
+                    event["event"] == "syscall"
+                        && event["result"].as_i64().is_some_and(|result| result < 0)
+                })
+                .all(|event| event["opened_file"].is_null())
+        );
     }
 
     #[test]
