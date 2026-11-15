@@ -7,68 +7,52 @@ use crate::Profile;
 use crate::Syscalls;
 
 /// Profile derived from observed worker behavior.
-///
-/// Includes individual loader and OpenSSL configuration files when present,
-/// without exposing the rest of `/etc`.
 pub fn tpm_worker() -> Builder {
-    let mut profile = Profile::deny_all().name("tpm_worker").read_exec("/usr/lib");
+    // Deny access by default.
+    let mut profile = Profile::deny_all().name("tpm_worker");
+    let cwd = std::env::current_dir().unwrap_or_default();
 
-    for path in [
-        "/etc/ld.so.cache",
-        "/etc/ssl/openssl.cnf",
-        "/etc/pki/tls/openssl.cnf",
-        "/usr/local/ssl/openssl.cnf",
-    ] {
-        if std::path::Path::new(path).exists() {
+    // Read-only paths.
+    for path in ["/etc/ld.so.cache", "/etc/pki/tls/openssl.cnf"] {
+        let path = std::path::Path::new(path);
+        if path.exists() {
             profile = profile.read(path);
         }
     }
 
+    // Read and execute paths.
+    for path in [
+        cwd.to_str().unwrap_or_default(), // Allow read/execute access to the worker's working directory.
+        "/etc/ssl/openssl.cnf",
+        "/opt/containerd/lib",
+        "/usr/lib/libc.so.6",
+        "/usr/lib/libgcc_s.so.1",
+        "/usr/lib/libm.so.6",
+        "/usr/local/ssl/openssl.cnf",
+    ] {
+        let path = std::path::Path::new(path);
+        if path.exists() {
+            profile = profile.read_exec(path);
+        }
+    }
+
+    // Network access.
+    profile = profile.network(Network::None);
+
+    // System call restrictions.
+    profile = profile.syscalls(Syscalls::deny([
+        "acct",
+        "add_key",
+        "io_uring_enter",
+        "io_uring_register",
+        "io_uring_setup",
+        "kcmp",
+        "keyctl",
+        "mbind",
+        "request_key",
+    ]));
+
     profile
-        .syscalls(Syscalls::deny([
-            "bpf",
-            "chroot",
-            "clone3",
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            "create_module",
-            "delete_module",
-            "execve",
-            "finit_module",
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            "fork",
-            "fsconfig",
-            "fsmount",
-            "fsopen",
-            "fspick",
-            "init_module",
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            "ioperm",
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            "iopl",
-            "kexec_file_load",
-            "kexec_load",
-            "mount",
-            "mount_setattr",
-            "move_mount",
-            "open_tree",
-            "pivot_root",
-            "process_vm_readv",
-            "process_vm_writev",
-            "ptrace",
-            "reboot",
-            "setns",
-            "umount2",
-            "unshare",
-            "userfaultfd",
-            "waitid",
-            "acct",
-            "add_key",
-            "kcmp",
-            "keyctl",
-            "mbind",
-            "request_key",
-        ]))
-        .network(Network::None)
 }
 
 #[cfg(all(test, target_os = "linux"))]

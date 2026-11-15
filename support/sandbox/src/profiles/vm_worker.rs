@@ -7,85 +7,61 @@ use crate::Profile;
 use crate::Syscalls;
 
 /// Profile derived from observed worker behavior.
-///
-/// Leaves `mbind` available for host NUMA placement of guest RAM.
-/// On Linux, includes individual loader and resolver configuration files and
-/// the SEV and legacy VFIO container nodes. Optional paths must exist when the
-/// profile is built.
 pub fn vm_worker() -> Builder {
-    let profile = Profile::deny_all()
-        .name("vm_worker")
-        .read("/sys/devices")
-        .read_exec("/usr/lib")
-        .syscalls(Syscalls::deny([
-            "bpf",
-            "chroot",
-            "clone3",
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            "create_module",
-            "delete_module",
-            "execve",
-            "finit_module",
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            "fork",
-            "fsconfig",
-            "fsmount",
-            "fsopen",
-            "fspick",
-            "init_module",
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            "ioperm",
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            "iopl",
-            "kexec_file_load",
-            "kexec_load",
-            "mount",
-            "mount_setattr",
-            "move_mount",
-            "open_tree",
-            "pivot_root",
-            "process_vm_readv",
-            "process_vm_writev",
-            "ptrace",
-            "reboot",
-            "setns",
-            "umount2",
-            "unshare",
-            "userfaultfd",
-            "waitid",
-            "acct",
-            "add_key",
-            "kcmp",
-            "keyctl",
-            "request_key",
-        ]))
-        .network(Network::Unrestricted);
+    // Deny access by default.
+    let mut profile = Profile::deny_all().name("vm_worker");
+    let cwd = std::env::current_dir().unwrap_or_default();
 
-    #[cfg(target_os = "linux")]
-    let profile = {
-        let mut profile = profile;
-        for path in [
-            "/etc/ld.so.cache",
-            "/etc/hosts",
-            "/etc/host.conf",
-            "/etc/gai.conf",
-            "/etc/nsswitch.conf",
-            "/etc/resolv.conf",
-        ] {
-            if std::path::Path::new(path).exists() {
-                profile = profile.read(path);
-            }
+    // Read-only paths.
+    for path in [
+        "/etc/host.conf",
+        "/etc/hosts",
+        "/etc/ld.so.cache",
+        "/etc/nsswitch.conf",
+        "/etc/resolv.conf",
+        "/sys/bus/pci/devices",
+        "/sys/devices",
+    ] {
+        let path = std::path::Path::new(path);
+        if path.exists() {
+            profile = profile.read(path);
         }
-        if std::path::Path::new("/sys/bus/pci/devices").exists() {
-            profile = profile.read("/sys/bus/pci/devices");
+    }
+
+    // Read and execute paths.
+    for path in [
+        cwd.to_str().unwrap_or_default(), // Allow read/execute access to the worker's working directory.
+        "/etc/gai.conf",
+        "/opt/containerd/lib",
+        "/usr/lib/libc.so.6",
+        "/usr/lib/libgcc_s.so.1",
+        "/usr/lib/libm.so.6",
+    ] {
+        let path = std::path::Path::new(path);
+        if path.exists() {
+            profile = profile.read_exec(path);
         }
-        for path in ["/dev/sev", "/dev/vfio/vfio"] {
-            if std::path::Path::new(path).exists() {
-                profile = profile.device(path);
-            }
+    }
+
+    // Device access.
+    for path in ["/dev/sev", "/dev/vfio/vfio"] {
+        let path = std::path::Path::new(path);
+        if path.exists() {
+            profile = profile.device(path);
         }
-        profile
-    };
+    }
+
+    // Network access.
+    profile = profile.network(Network::Unrestricted);
+
+    // System call restrictions.
+    profile = profile.syscalls(Syscalls::deny([
+        "acct",
+        "add_key",
+        "kcmp",
+        "keyctl",
+        "request_key",
+    ]));
 
     profile
 }
