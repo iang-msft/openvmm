@@ -6619,6 +6619,7 @@ dependencies = [
  "futures",
  "libc",
  "pal",
+ "sandbox",
  "seccompiler",
  "serde_json",
  "tempfile",

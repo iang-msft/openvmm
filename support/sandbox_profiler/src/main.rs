@@ -6,8 +6,6 @@
 #![forbid(unsafe_code)]
 
 use clap::Parser;
-use sandbox_profiler::TraceOptions;
-use sandbox_profiler::TraceReport;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -25,76 +23,24 @@ struct Options {
     profile_dir: Option<PathBuf>,
 }
 
-fn write_log_file(trace_report: &TraceReport) {
-    println!("generated profile: {}", trace_report.profile_path.display());
-    println!("generated log: {}", trace_report.log_path.display());
-    println!("trace files: {}", trace_report.trace_files.len());
-
-    if trace_report.observed_filesystem.is_empty() {
-        println!("filesystem accesses: none observed");
-    } else {
-        println!("filesystem accesses observed:");
-        for observation in &trace_report.observed_filesystem {
-            println!("  - {observation}");
-        }
-    }
-
-    if trace_report.observed_network.is_empty() {
-        println!("network accesses: none observed");
-    } else {
-        println!("network accesses observed:");
-        for observation in &trace_report.observed_network {
-            println!("  - {observation}");
-        }
-    }
-
-    println!(
-        "observed syscalls: {}",
-        trace_report.observed_syscalls.len()
-    );
-
-    println!(
-        "read-only grants: {}",
-        trace_report.policy_read_paths.len() + trace_report.policy_cwd.policy_read_paths.len()
-    );
-    println!(
-        "read-write grants: {}",
-        trace_report.policy_read_write_paths.len()
-            + trace_report.policy_cwd.policy_read_write_paths.len()
-    );
-    println!(
-        "device grants: {}",
-        trace_report.policy_device_paths.len() + trace_report.policy_cwd.policy_device_paths.len()
-    );
-    println!(
-        "worker-CWD-relative grants: {}",
-        trace_report.policy_cwd.policy_read_paths.len()
-            + trace_report.policy_cwd.policy_read_write_paths.len()
-            + trace_report.policy_cwd.policy_device_paths.len()
-    );
-    println!(
-        "generated network policy: {:?}",
-        trace_report.policy_network
-    );
-    println!(
-        "generated syscall denials: {}",
-        trace_report.policy_syscalls.join(", ")
-    );
-}
-
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
+    use sandbox_profiler::TraceOptions;
+
     let options = Options::parse();
     let profile_dir = options
         .profile_dir
         .unwrap_or_else(|| options.trace_dir.clone());
-    let trace_report = sandbox_profiler::build_profile(&TraceOptions {
+    sandbox_profiler::build_profile(&TraceOptions {
         trace_dir: options.trace_dir,
         worker: options.worker,
         profile_dir,
-    })?;
+    })
+}
 
-    write_log_file(&trace_report);
-    Ok(())
+#[cfg(not(target_os = "linux"))]
+fn main() -> anyhow::Result<()> {
+    anyhow::bail!("sandbox_profiler is supported only on Linux")
 }
 
 #[cfg(test)]

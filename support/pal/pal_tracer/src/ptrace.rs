@@ -502,12 +502,10 @@ fn handle_syscall_exit(
     let entry = pending
         .take()
         .ok_or_else(|| io::Error::other("syscall exit stop has no pending seccomp event"))?;
-    let opened_file = (entry.sys_nr == libc::SYS_openat as u64
-        && exit.is_error == 0
-        && exit.sval >= 0)
-        .then(|| {
-            opened_file_metadata(tid, exit.sval).unwrap_or_else(|_| json!({"file_type": "unknown"}))
-        });
+    let opens_file = is_open_syscall(entry.sys_nr) || entry.sys_nr == libc::SYS_openat as u64;
+    let opened_file = (opens_file && exit.is_error == 0 && exit.sval >= 0).then(|| {
+        opened_file_metadata(tid, exit.sval).unwrap_or_else(|_| json!({"file_type": "unknown"}))
+    });
     let success = exit.is_error == 0 && exit.sval >= 0;
     let path_metadata = success
         .then(|| {
@@ -517,7 +515,7 @@ fn handle_syscall_exit(
                     stat_file_metadata(tid, entry.sys_nr, entry.args)
                         .unwrap_or_else(|_| json!({"file_type": "unknown"})),
                 )
-            } else if entry.sys_nr == libc::SYS_openat as u64 {
+            } else if opens_file {
                 None
             } else {
                 entry.path_metadata.or_else(|| {
@@ -605,7 +603,11 @@ fn snapshot_path_metadata(
     second_path: bool,
 ) -> Option<Value> {
     let path = decoded[if second_path { "path2" } else { "path" }].as_str()?;
-    let dirfd = args[if second_path { 2 } else { 0 }] as libc::c_int;
+    let dirfd = if is_open_syscall(sys_nr) {
+        libc::AT_FDCWD
+    } else {
+        args[if second_path { 2 } else { 0 }] as libc::c_int
+    };
     if path.is_empty() && dirfd != libc::AT_FDCWD {
         return Some(
             opened_file_metadata(tid, dirfd.into())
@@ -701,6 +703,10 @@ fn parse_stat_metadata(bytes: &[u8]) -> Option<Value> {
     ))
 }
 
+fn is_open_syscall(sys_nr: u64) -> bool {
+    sandbox::nr_for_name("open").is_some_and(|nr| sys_nr == nr as u64)
+}
+
 // Converts policy-relevant pointer arguments into stable trace data. Keeping
 // this decoding in the tracer lets the profile builder operate entirely on
 // JSON without reading child memory.
@@ -712,8 +718,8 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
         let path = read_c_string(tid, args[1]).ok();
         let path2 = read_c_string(tid, args[3]).ok();
         return json!({
-            "path_base": path_base(tid, args[0], path.as_deref()),
-            "path2_base": path_base(tid, args[2], path2.as_deref()),
+            "path_base": path_base(tid, args[0], path.as_deref(), false),
+            "path2_base": path_base(tid, args[2], path2.as_deref(), false),
             "path_origin": path_origin(args[0], path.as_deref()),
             "path2_origin": path_origin(args[2], path2.as_deref()),
             "path": path,
@@ -721,7 +727,9 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
         });
     }
 
-    let path_address = if sys_nr == libc::SYS_openat as u64
+    let (path_address, dirfd) = if is_open_syscall(sys_nr) {
+        (Some(args[0]), libc::AT_FDCWD as i64 as u64)
+    } else if sys_nr == libc::SYS_openat as u64
         || sys_nr == libc::SYS_newfstatat as u64
         || sys_nr == libc::SYS_statx as u64
         || sys_nr == libc::SYS_readlinkat as u64
@@ -730,16 +738,23 @@ fn decode_args(tid: i32, sys_nr: u64, args: [u64; 6]) -> Value {
         || sys_nr == libc::SYS_mkdirat as u64
         || sys_nr == libc::SYS_unlinkat as u64
     {
-        Some(args[1])
+        (Some(args[1]), args[0])
     } else {
-        None
+        (None, args[0])
     };
 
     if let Some(path) = path_address.and_then(|address| read_c_string(tid, address).ok()) {
+        let uses_descriptor =
+            if sys_nr == libc::SYS_newfstatat as u64 || sys_nr == libc::SYS_faccessat2 as u64 {
+                args[3] & libc::AT_EMPTY_PATH as u64 != 0
+            } else if sys_nr == libc::SYS_statx as u64 {
+                args[2] & libc::AT_EMPTY_PATH as u64 != 0
+            } else {
+                sys_nr == libc::SYS_readlinkat as u64
+            };
         return json!({
-            "path_base": path_base(tid, args[0], Some(&path)),
-            "path_origin": path_origin(args[0], Some(&path)),
-            "path_target": empty_path_target(tid, sys_nr, args, &path),
+            "path_base": path_base(tid, dirfd, Some(&path), uses_descriptor),
+            "path_origin": path_origin(dirfd, Some(&path)),
             "path": path,
         });
     }
@@ -771,9 +786,14 @@ fn path_origin(dirfd: u64, path: Option<&str>) -> Option<&'static str> {
     })
 }
 
-fn path_base(tid: i32, dirfd: u64, path: Option<&str>) -> Option<String> {
+// Capture the directory for a relative pathname, or the descriptor's object
+// for an empty pathname when the syscall supports descriptor-based access.
+fn path_base(tid: i32, dirfd: u64, path: Option<&str>, uses_descriptor: bool) -> Option<String> {
     let path = Path::new(path?);
-    if path.is_absolute() || path.as_os_str().is_empty() {
+    if path.as_os_str().is_empty() {
+        return uses_descriptor.then(|| fd_target(tid, dirfd)).flatten();
+    }
+    if path.is_absolute() {
         return None;
     }
 
@@ -782,21 +802,6 @@ fn path_base(tid: i32, dirfd: u64, path: Option<&str>) -> Option<String> {
         return None;
     }
     Some(base)
-}
-
-fn empty_path_target(tid: i32, sys_nr: u64, args: [u64; 6], path: &str) -> Option<String> {
-    if !path.is_empty() {
-        return None;
-    }
-    let uses_descriptor =
-        if sys_nr == libc::SYS_newfstatat as u64 || sys_nr == libc::SYS_faccessat2 as u64 {
-            args[3] & libc::AT_EMPTY_PATH as u64 != 0
-        } else if sys_nr == libc::SYS_statx as u64 {
-            args[2] & libc::AT_EMPTY_PATH as u64 != 0
-        } else {
-            sys_nr == libc::SYS_readlinkat as u64
-        };
-    uses_descriptor.then(|| fd_target(tid, args[0])).flatten()
 }
 
 fn fd_target(tid: i32, dirfd: u64) -> Option<String> {
@@ -1096,6 +1101,40 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn decodes_open_path_and_cwd_base() {
+        let tid = std::process::id() as i32;
+        let cwd = std::env::current_dir().unwrap();
+        for path in [c"relative/data", c"/etc/hosts", c""] {
+            let decoded = decode_args(
+                tid,
+                libc::SYS_open as u64,
+                [
+                    path.as_ptr() as u64,
+                    (libc::O_RDWR | libc::O_CREAT) as u64,
+                    0o640,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            assert_eq!(decoded["path"], path.to_str().unwrap());
+            if path == c"relative/data" {
+                assert_eq!(decoded["path_base"], cwd.to_str().unwrap());
+                assert_eq!(decoded["path_origin"], "cwd_relative");
+            } else {
+                assert!(decoded["path_base"].is_null());
+                assert_eq!(
+                    decoded["path_origin"],
+                    if path == c"" { "empty" } else { "absolute" }
+                );
+            }
+            assert!(decoded.get("path_target").is_none());
+        }
+        assert!(decode_args(tid, libc::SYS_open as u64, [0; 6]).is_null());
+    }
+
     #[test]
     fn decodes_relative_path_bases() {
         let dir = tempfile::tempdir().unwrap();
@@ -1208,8 +1247,8 @@ mod tests {
                 }
                 let decoded = decode_args(tid, sys_nr as u64, args);
                 assert_eq!(decoded["path"], "");
-                assert!(decoded["path_base"].is_null());
-                assert_eq!(decoded["path_target"], expected.to_str().unwrap());
+                assert_eq!(decoded["path_base"], expected.to_str().unwrap());
+                assert!(decoded.get("path_target").is_none());
             }
         }
     }
@@ -1227,7 +1266,8 @@ mod tests {
         ] {
             let decoded = decode_args(tid, sys_nr as u64, [dirfd, c"".as_ptr() as u64, 0, 0, 0, 0]);
             assert_eq!(decoded["path"], "");
-            assert!(decoded["path_target"].is_null());
+            assert!(decoded["path_base"].is_null());
+            assert!(decoded.get("path_target").is_none());
         }
         for (sys_nr, dirfd, path) in [
             (libc::SYS_faccessat, dirfd, c""),
@@ -1247,7 +1287,15 @@ mod tests {
                 ],
             );
             assert_eq!(decoded["path"], path.to_str().unwrap());
-            assert!(decoded["path_target"].is_null());
+            if path == c"relative" {
+                assert_eq!(
+                    decoded["path_base"],
+                    fs_err::canonicalize(file.path()).unwrap().to_str().unwrap()
+                );
+            } else {
+                assert!(decoded["path_base"].is_null());
+            }
+            assert!(decoded.get("path_target").is_none());
         }
     }
 
@@ -1287,8 +1335,8 @@ mod tests {
                 ],
             );
             assert_eq!(decoded["path"], "");
-            assert_eq!(decoded["path_target"], expected);
-            assert!(decoded["path_base"].is_null());
+            assert_eq!(decoded["path_base"], expected);
+            assert!(decoded.get("path_target").is_none());
         }
     }
 
@@ -1507,6 +1555,104 @@ mod tests {
                 }),
                 "{program}: {events:?}"
             );
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn traces_open_to_json_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        data.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        let config = TraceConfig::new(
+            dir.path().to_path_buf(),
+            "worker",
+            BTreeMap::from([(libc::SYS_open, "open".to_string())]),
+        );
+        let mut command = pal::unix::process::Builder::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "ptrace::tests::helper_open_syscall",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PAL_TRACER_OPEN_PATH", data.path());
+        command.set_trace_seccomp_filter(build_seccomp_filter(&config).unwrap());
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let mut traced = TracedChild::start(child, "test-worker", config).unwrap();
+        assert!(
+            futures::executor::block_on(traced.wait())
+                .unwrap()
+                .success()
+        );
+
+        let file = File::open(dir.path().join(format!("worker-test-worker.{pid}.jsonl"))).unwrap();
+        let events = io::BufReader::new(file)
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+            .filter(|event| event["event"] == "syscall")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|event| { event["syscall"] == "open" && event["sys_nr"] == libc::SYS_open })
+        );
+        let opened = events
+            .iter()
+            .find(|event| event["decoded_args"]["path"] == data.path().to_str().unwrap())
+            .unwrap();
+        assert!(opened["result"].as_i64().unwrap() >= 0);
+        assert_eq!(opened["opened_file"]["file_type"], "regular_file");
+        assert_eq!(opened["opened_file"]["mode"], libc::S_IFREG | 0o640);
+        assert_eq!(opened["opened_file"]["executable"], false);
+        assert_eq!(opened["opened_file"]["path"], data.path().to_str().unwrap());
+        assert!(opened["path_metadata"].is_null());
+        let device = events
+            .iter()
+            .find(|event| event["decoded_args"]["path"] == "/dev/null")
+            .unwrap();
+        assert_eq!(device["opened_file"]["file_type"], "character_device");
+        assert_eq!(device["opened_file"]["device_major"], 1);
+        assert_eq!(device["opened_file"]["device_minor"], 3);
+        let failed = events
+            .iter()
+            .find(|event| event["result"].as_i64().unwrap() < 0)
+            .unwrap();
+        assert_eq!(failed["errno"], libc::ENOENT);
+        assert!(failed["opened_file"].is_null());
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    #[ignore]
+    fn helper_open_syscall() {
+        use std::os::fd::FromRawFd;
+
+        let data_path = std::env::var("PAL_TRACER_OPEN_PATH").unwrap();
+        for (path, succeeds) in [
+            (data_path.clone(), true),
+            ("/dev/null".to_string(), true),
+            (format!("{data_path}.missing"), false),
+        ] {
+            let path = std::ffi::CString::new(path).unwrap();
+            // SAFETY: path is a valid NUL-terminated string; O_RDONLY needs no mode.
+            let fd = unsafe { libc::syscall(libc::SYS_open, path.as_ptr(), libc::O_RDONLY) };
+            if succeeds {
+                assert!(fd >= 0);
+                // SAFETY: open returned a new descriptor owned by this test.
+                drop(unsafe { File::from_raw_fd(fd as i32) });
+            } else {
+                assert_eq!(fd, -1);
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENOENT)
+                );
+            }
         }
     }
 

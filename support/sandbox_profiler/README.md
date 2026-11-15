@@ -128,13 +128,15 @@ Successful results appear as `SUCCESS`. Error names come from the trace's errno
 when available, otherwise from the negative syscall result. Unmapped error
 numbers appear as `ERRNO_<number>`; missing outcomes appear as `UNKNOWN`.
 
-For empty-path descriptor operations, the tracer preserves the original
-`path: ""` and records `path_target` at syscall entry from `/proc/<tid>/fd/<dirfd>`,
+For relative pathname operations, `path_base` records the directory used to
+resolve `path`. For empty-path descriptor operations, the tracer preserves the
+original `path: ""` and records the descriptor's object in `path_base` at syscall
+entry from `/proc/<tid>/fd/<dirfd>`,
 or `/proc/<tid>/cwd` for `AT_FDCWD`. This applies to `newfstatat`, `statx`, and
 `faccessat2` with `AT_EMPTY_PATH`, and to `readlinkat` with an empty pathname.
-The filesystem observation uses that recorded target. Non-path descriptor
-descriptions, such as `anon_inode:[eventpoll]`, and deleted-file annotations are
-preserved. When the target is unavailable or absent in an older trace, the
+The filesystem observation uses `path_base` directly when `path` is empty.
+Non-path descriptor descriptions, such as `anon_inode:[eventpoll]`, and deleted-file
+annotations are preserved. When `path_base` is unavailable, the
 observation uses an explicit description such as
 `<empty pathname; statx; dirfd: 8>, RO, SUCCESS`. These descriptor-based
 observations do not produce additional pathname grants.
@@ -158,7 +160,12 @@ The existing broad CWD grant is unchanged and can cover non-executable files.
 observations without additional pathname grants. Root-wide grants are also
 excluded.
 
-After a successful `openat`, the tracer records an `opened_file` object with the
+The tracer handles `open` on x86/x86-64 and `openat` on all supported architectures.
+`open` uses the pathname in argument 0 and flags in argument 1, with relative
+paths resolved against the tracee's CWD. `openat` uses the directory descriptor
+in argument 0, pathname in argument 1, and flags in argument 2.
+
+After a successful `open` or `openat`, the tracer records an `opened_file` object with the
 opened object's `file_type`, full numeric `mode` (including file type and permission
 bits), `executable` (whether any `0o111` bit is set), descriptor target `path`, and, for character/block
 devices, `device_major` and `device_minor`. It snapshots the returned descriptor

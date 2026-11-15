@@ -156,11 +156,10 @@ fn survival_syscall_nrs() -> [i64; 4] {
 /// dropped deny entry makes the installed filter *less* restrictive than the
 /// author intended, silently leaving a syscall reachable (R-S12, fail-loud).
 ///
-/// The recognized set is intentionally limited to syscalls that exist on every
-/// Linux architecture this project targets, expressed in their modern spelling
-/// (`openat` not `open`, `ppoll` not `poll`, `dup3` not `dup2`, `newfstatat`
-/// not `stat`). Legacy aliases can be added behind an architecture `cfg` when a
-/// worker genuinely needs them.
+/// The recognized set primarily uses syscalls available on every supported
+/// Linux architecture, expressed in their modern spelling (`ppoll` rather than
+/// `poll`, `newfstatat` rather than `stat`). Legacy syscalls such as `open` and
+/// `dup2` are recognized behind architecture-specific `cfg` guards.
 pub fn nr_for_name(name: &str) -> Option<i64> {
     let nr = match name {
         // Process lifecycle
@@ -192,6 +191,8 @@ pub fn nr_for_name(name: &str) -> Option<i64> {
         "writev" => libc::SYS_writev,
         "pwrite64" => libc::SYS_pwrite64,
         "close" => libc::SYS_close,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "open" => libc::SYS_open,
         "openat" => libc::SYS_openat,
         "fstat" => libc::SYS_fstat,
         "newfstatat" => libc::SYS_newfstatat,
@@ -840,7 +841,9 @@ mod tests {
         assert_eq!(nr_for_name("tgkill"), Some(libc::SYS_tgkill));
         assert_eq!(nr_for_name("exit_group"), Some(libc::SYS_exit_group));
         assert_eq!(nr_for_name("definitely_not_a_syscall"), None);
-        // Legacy spellings are intentionally not recognized.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert_eq!(nr_for_name("open"), Some(libc::SYS_open));
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         assert_eq!(nr_for_name("open"), None);
         assert_eq!(nr_for_name("poll"), None);
     }
